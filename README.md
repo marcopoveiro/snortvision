@@ -76,51 +76,43 @@ The connection panel now clearly represents the service chain:
 
 ```text
 SSH → Backend API → Snort3 Process
-🌐 Router Management Target
+```
 
+This makes it easier to identify where connectivity or service failures occur.
+
+### 🌐 Router Management Target
 Optional router integration currently supports scenarios such as:
 
-OpenWRT
-
-Generic Linux / router-based systems
+- OpenWRT
+- Generic Linux / router-based systems
 
 Available router-side checks can include:
 
-host reachability
+- host reachability
+- firmware information
+- WAN / LAN addressing
+- monitored interface details
+- bridge or interface names
+- firewall zones
+- mirror / SPAN hints
+- tcpdump availability
+- traffic counters
+- Snort / Suricata presence detection
 
-firmware information
-
-WAN / LAN addressing
-
-monitored interface details
-
-bridge or interface names
-
-firewall zones
-
-mirror / SPAN hints
-
-tcpdump availability
-
-traffic counters
-
-Snort / Suricata presence detection
-
-🔐 Backend API Improvements
-
+### 🔐 Backend API Improvements
 The backend connection panel includes:
 
-username field
+- username field
+- password field
+- API key visibility toggle
+- verification button
+- visual pass / fail feedback
 
-password field
+---
 
-API key visibility toggle
+## Architecture
 
-verification button
-
-visual pass / fail feedback
-
-Architecture
+```text
 ┌──────────────────────────────┐
 │         Snort Sensor         │
 │      alert_json.txt feed     │
@@ -145,56 +137,80 @@ Optional management target:
 │      Router / Firewall       │
 │ OpenWRT / Linux-based target │
 └──────────────────────────────┘
-Technology Stack
+```
 
-Snort 3
+---
 
-React frontend
+## Technology Stack
 
-Node.js backend
+- **Snort 3**
+- **React** frontend
+- **Node.js** backend
+- **SQLite** database
+- **WebSocket** live updates
+- **Docker / Docker Compose** deployment
 
-SQLite database
+---
 
-WebSocket live updates
+## Quick Start
 
-Docker / Docker Compose deployment
+### 1. Clone the repository
 
-Quick Start
-1. Clone the repository
+```bash
 git clone https://github.com/marcopoveiro/snortvision.git
 cd snortvision
-2. Prepare the environment
+```
+
+### 2. Prepare the environment
+
+```bash
 cp .env.example .env
+```
 
-Edit .env with your environment values.
+Edit `.env` with your environment values.
 
-3. Deploy with the helper script
+### 3. Deploy with the helper script
+
+```bash
 chmod +x deploy.sh
 ./deploy.sh
-4. Open the interface
+```
 
-Frontend: http://localhost:3000
+### 4. Open the interface
 
-Backend: http://localhost:4000
+- **Frontend:** `http://localhost:3000`
+- **Backend:** `http://localhost:4000`
 
-Docker Deployment
+---
+
+## Docker Deployment
 
 To run SnortVision directly with Docker Compose:
 
+```bash
 docker compose up -d --build
+```
 
 To stop the stack:
 
+```bash
 docker compose down
+```
 
 To rebuild cleanly:
 
+```bash
 docker compose down -v
 docker compose up -d --build
-Important Environment Settings
+```
+
+---
+
+## Important Environment Settings
 
 Example configuration:
 
+```env
 FRONTEND_PORT=3000
 BACKEND_PORT=4000
 
@@ -217,155 +233,183 @@ SENSOR_INTERFACE=ens18
 DDOS_PACKET_PPS_THRESHOLD=8000
 DDOS_ALERT_RATE_THRESHOLD=20
 BACKEND_URL=http://192.168.1.72:4000
-Real Traffic Counters
+```
+
+---
+
+## Real Traffic Counters
 
 To use real traffic counters, define the actual capture interface used by Snort:
 
+```env
 SENSOR_INTERFACE=ens18
+```
 
 Examples:
 
-ens18
-
-ens19
-
-eth0
-
-eth1
+- `ens18`
+- `ens19`
+- `eth0`
+- `eth1`
 
 This must match the real sniffing or mirrored interface used by the sensor.
 
-GeoIP Support
+---
+
+## GeoIP Support
 
 For the best live attack map experience, enable GeoIP:
 
+```env
 GEOIP_ENABLE=true
+```
 
 If disabled, SnortVision will still function, but map enrichment and geographic visibility will be limited.
 
-Main Pages
-Page	Purpose
-Dashboard	Live traffic overview, totals, severity visibility, attack map
-Alerts / Traffic	Real-time event and alert table
-IP Discovery / Blocklist	Discovered IPs, manual block, auto-block workflows
-DDoS Mitigation	Threshold monitoring, mitigation visibility, generated rules
-Rules	Snort rule management
-Notifications	Telegram, Email, Slack, Jira settings
-Connection	Snort sensor, router target, backend verification
-Development Notes
+---
 
-SnortVision v0.1 is primarily a development-first build intended for:
+## Main Pages
 
-home labs
+| Page | Purpose |
+|------|---------|
+| **Dashboard** | Live traffic overview, totals, severity visibility, attack map |
+| **Alerts / Traffic** | Real-time event and alert table |
+| **IP Discovery / Blocklist** | Discovered IPs, manual block, auto-block workflows |
+| **DDoS Mitigation** | Threshold monitoring, mitigation visibility, generated rules |
+| **Rules** | Snort rule management |
+| **Notifications** | Telegram, Email, Slack, Jira settings |
+| **Connection** | Snort sensor, router target, backend verification |
 
-testing environments
+---
 
-proof of concept
+## Development Notes
 
-feature validation
+SnortVision v0.1 is primarily a **development-first build** intended for:
 
-live UI iteration
-
-ongoing backend integration work
+- home labs
+- testing environments
+- proof of concept
+- feature validation
+- live UI iteration
+- ongoing backend integration work
 
 Some modules are already usable and visually mature, while others are still being refined.
 
-Troubleshooting
-Backend container starts but health check fails
+---
+
+## Troubleshooting
+
+### Backend container starts but health check fails
 
 Check backend logs:
 
+```bash
 sudo docker logs --tail 100 snortvision-backend
-SnortVision still tries SSH tail mode
+```
 
-Check .env:
+### SnortVision still tries SSH tail mode
 
+Check `.env`:
+
+```env
 SNORT_HOST=
+```
 
-If Snort and the backend run on the same host, leave SNORT_HOST empty to use local mode.
+If Snort and the backend run on the same host, leave `SNORT_HOST` empty to use local mode.
 
-No traffic appears on the dashboard
+### No traffic appears on the dashboard
 
 Verify the sniffing interface:
 
+```bash
 sudo tcpdump -ni ens18 -c 20
+```
 
 Then confirm:
 
+```env
 SENSOR_INTERFACE=ens18
-GeoIP data is not appearing
+```
+
+### GeoIP data is not appearing
 
 Make sure this is enabled:
 
+```env
 GEOIP_ENABLE=true
+```
 
 Then rebuild:
 
+```bash
 docker compose up -d --build
-Docker build fails on Debian-based Node images due to apk
+```
+
+### Docker build fails on Debian-based Node images due to `apk`
 
 If your backend Dockerfile uses:
 
+```dockerfile
 FROM node:20-bookworm-slim
+```
 
-Do not use Alpine package commands such as:
+Do **not** use Alpine package commands such as:
 
+```dockerfile
 RUN apk add ...
+```
 
 Use Debian-compatible packages instead:
 
+```dockerfile
 RUN apt-get update && apt-get install -y openssh-client iptables && rm -rf /var/lib/apt/lists/*
-Roadmap
+```
+
+---
+
+## Roadmap
 
 Planned improvement areas include:
 
-stronger production hardening
+- stronger production hardening
+- improved parser coverage
+- richer DDoS logic
+- more accurate attack classification
+- smarter map intelligence
+- export and reporting capabilities
+- multi-sensor support
+- advanced router enforcement
+- stronger authentication flows
+- more polished release packaging
 
-improved parser coverage
+---
 
-richer DDoS logic
-
-more accurate attack classification
-
-smarter map intelligence
-
-export and reporting capabilities
-
-multi-sensor support
-
-advanced router enforcement
-
-stronger authentication flows
-
-more polished release packaging
-
-Support the Project
+## Support the Project
 
 If you like the project, support its visibility and development:
 
-GitHub
+### GitHub
+- ⭐ Star the repository
+- 🍴 Follow the project
+- 🐛 Report bugs
+- 💡 Suggest improvements
 
-⭐ Star the repository
-
-🍴 Follow the project
-
-🐛 Report bugs
-
-💡 Suggest improvements
-
-LinkedIn
-
+### LinkedIn
 If you enjoyed the creation of SnortVision, support on LinkedIn is always appreciated:
 
-🔗 Marco Mata on LinkedIn
+[🔗 Marco Mata on LinkedIn](https://www.linkedin.com/in/marco-mata-lux)
 
-Author
+---
 
-Marco Mata
+## Author
+
+**Marco Mata**  
 Made in Luxembourg 🇱🇺
 
-Disclaimer
+---
 
-SnortVision v0.1 is a first launch / testing release.
+## Disclaimer
 
-It is intended for validation, experimentation, and progressive improvement. While already functional in lab and development scenarios, it should be used carefully in production environments until later hardening phases are completed.
+**SnortVision v0.1** is a **first launch / testing release**.
+
+It is intended for **validation**, **experimentation**, and **progressive improvement**. While already functional in lab and development scenarios, it should be used carefully in production environments until later hardening phases are completed.
