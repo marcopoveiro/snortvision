@@ -1,0 +1,86 @@
+services:
+
+  # ── React Frontend (Vite build → Nginx) ──────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: snortvision-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - backend
+    networks:
+      - snortvision-net
+
+  # ── Node.js Backend (API + WebSocket + SSH tail) ──────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: snortvision-backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-4000}:4000"
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      # Snort machine SSH connection
+      - SNORT_HOST=${SNORT_HOST:-}
+      - SNORT_SSH_PORT=${SNORT_SSH_PORT:-22}
+      - SNORT_SSH_USER=${SNORT_SSH_USER:-snort}
+      - SNORT_SSH_KEY_PATH=/app/keys/snort_id_rsa
+      - SNORT_LOG_PATH=${SNORT_LOG_PATH:-/var/log/snort/alert_json.txt}
+      - SENSOR_INTERFACE=${SENSOR_INTERFACE:-}
+      - DDOS_PACKET_PPS_THRESHOLD=${DDOS_PACKET_PPS_THRESHOLD:-8000}
+      - DDOS_ALERT_RATE_THRESHOLD=${DDOS_ALERT_RATE_THRESHOLD:-20}
+      # Optional router management target (OpenWRT / generic SSH router)
+      - ROUTER_HOST=${ROUTER_HOST:-}
+      - ROUTER_SSH_PORT=${ROUTER_SSH_PORT:-22}
+      - ROUTER_SSH_USER=${ROUTER_SSH_USER:-root}
+      - ROUTER_AUTH_MODE=${ROUTER_AUTH_MODE:-Password}
+      - ROUTER_TYPE=${ROUTER_TYPE:-OpenWRT}
+      - ROUTER_MONITOR_IFACE=${ROUTER_MONITOR_IFACE:-}
+      - ROUTER_MIRROR_TARGET=${ROUTER_MIRROR_TARGET:-}
+      - ROUTER_SSH_KEY_PATH=/app/keys/router_id_rsa
+      # Optional API key auth (leave blank = no auth)
+      - API_KEY=${API_KEY:-}
+      # GeoIP (set true after: docker compose exec backend npm run geoip-update)
+      - GEOIP_ENABLE=${GEOIP_ENABLE:-false}
+      # Telegram alerts
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_MIN_SEVERITY=${TELEGRAM_MIN_SEVERITY:-high}
+      # Email alerts
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-false}
+      - EMAIL_SMTP=${EMAIL_SMTP:-smtp.gmail.com}
+      - EMAIL_PORT=${EMAIL_PORT:-587}
+      - EMAIL_USER=${EMAIL_USER:-}
+      - EMAIL_PASS=${EMAIL_PASS:-}
+      - EMAIL_TO=${EMAIL_TO:-}
+      - EMAIL_MIN_SEVERITY=${EMAIL_MIN_SEVERITY:-critical}
+      # Slack alerts
+      - SLACK_ENABLED=${SLACK_ENABLED:-false}
+      - SLACK_WEBHOOK=${SLACK_WEBHOOK:-}
+      - SLACK_MIN_SEVERITY=${SLACK_MIN_SEVERITY:-high}
+      # Snort rules path on the backend container (for Rules Manager → Deploy)
+      - RULES_PATH=${RULES_PATH:-/etc/snort/rules/snortvision.rules}
+      - DB_PATH=/app/data/snortvision.db
+    volumes:
+      - ./.env:/app/.env                 # Persist API key + UI env writes on the host
+      - ./keys:/app/keys:ro              # SSH private keys for sensor/router
+      - snortvision-data:/app/data        # Persistent SQLite database
+      - ./backend/config:/app/config      # Runtime config overrides
+      - /var/log/snort:/var/log/snort     # Snort alert log (local mode)
+      - /etc/snort:/etc/snort             # Snort config & rules
+    networks:
+      - snortvision-net
+
+networks:
+  snortvision-net:
+    driver: bridge
+
+volumes:
+  snortvision-data:
+    driver: local
