@@ -1,91 +1,61 @@
-# SnortVision v0.1
+# 🛡️ SnortVision v0.1
 
-This is the **first launch and testing build** of SnortVision.
+<p align="center">
+  <b>Real-time Snort 3 monitoring dashboard with live traffic visibility, alert ingestion, DDoS monitoring, router integration, and backend API control.</b>
+</p>
 
-Real-time Snort3 IDS monitoring dashboard with live attack map, alert management, DDoS mitigation, and integrated backend API.
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.1-orange?style=for-the-badge">
+  <img alt="Status" src="https://img.shields.io/badge/status-under%20development-red?style=for-the-badge">
+  <img alt="Build" src="https://img.shields.io/badge/build-first%20launch%20testing-blue?style=for-the-badge">
+  <img alt="Snort 3" src="https://img.shields.io/badge/Snort-3.x-success?style=for-the-badge">
+  <img alt="Node.js" src="https://img.shields.io/badge/backend-Node.js-339933?style=for-the-badge">
+  <img alt="React" src="https://img.shields.io/badge/frontend-React-61DAFB?style=for-the-badge">
+  <img alt="SQLite" src="https://img.shields.io/badge/database-SQLite-003B57?style=for-the-badge">
+</p>
 
-## First Launch / Testing Build (v0.1)
+---
 
-### 1. Lighter Attack Map — CartoDB Voyager
-Switched from CartoDB Dark Matter to **CartoDB Voyager (light)** tiles. Country boundaries and geographic labels are now clearer, providing better visual contrast for attack lines and markers.
+## 🚀 Overview
 
-### 2. Attack Impact Pulses
-When attack lines reach the home server (Luxembourg), **animated pulse rings** expand outward from the target. Each pulse inherits the severity color — critical attacks flash red, scans pulse green. Multiple overlapping pulses create a visual intensity indicator during high-volume attacks.
+**SnortVision** is a modern monitoring interface for **Snort 3**, designed to provide a cleaner and more visual way to inspect alerts, traffic, suspicious hosts, and mitigation workflows.
 
-### 3. Connection Dependency Chain
-New visual **SSH → Backend API → Snort3 Process** dependency indicator on the Connection page. When SSH goes down, downstream services automatically show BLOCKED/DEGRADED status with cascade warnings. Includes disconnect button and status history.
+This release is the **first development and testing version (v0.1)**.
 
-### 4. Router Management Target (OpenWRT + Generic)
-Added a second connection box for a **router management target**. This target is optional and is not used as the source of Snort alerts unless Snort itself runs on the router. It can now query:
-- Router reachable state
-- Firmware version
-- WAN/LAN IPs
-- Monitored interface
-- Bridge/interface names
-- Firewall zones
-- Mirror/SPAN target hints
-- tcpdump presence
-- Packet counters
-- Snort/Suricata package presence
+It is already functional and useful for lab environments, testing, demonstrations, and ongoing development, but it is still **under active improvement**.
 
-### 5. Backend API Panel — Username/Password/IP Verification
-The Backend API & SQLite panel now includes:
-- **Username** and **Password** fields with show/hide toggles
-- **API Key** with visibility toggle
-- **Verify Credentials** button that pre-tests authentication before connecting
-- Visual pass/fail verification result badges
+---
 
-## Architecture
+## ✨ Main Features
 
-```
-┌─────────────────┐     SSH tail      ┌──────────────────┐
-│  Snort Sensor    │ ──────────────── │  Backend (Node)   │
-│  alert_json.txt  │                  │  SQLite + API     │
-└─────────────────┘                  │  WebSocket        │
-                                      └────────┬─────────┘
-                                               │ HTTP/WS
-                         optional SSH mgmt     │
-┌─────────────────┐ ───────────────────────────┘
+- 📡 Real-time Snort 3 alert ingestion
+- 📊 Live dashboard with traffic and severity overview
+- 🌍 GeoIP live attack map
+- 🚨 Alert monitoring and filtering
+- 🧠 DDoS detection indicators
+- 🛑 IP discovery / block management
+- 🌐 Router management target support
+- 🔐 Backend API + SQLite storage
+- 🔔 Notification integrations
+- ⚙️ Docker-based deployment
+- 🧪 Simulation/testing workflow for development
+
+---
+
+## 🧱 Architecture
+
+```text
+┌─────────────────┐     SSH tail / local tail     ┌──────────────────┐
+│  Snort Sensor   │ ────────────────────────────► │  Backend (Node)  │
+│  alert_json.txt │                               │  SQLite + API    │
+└─────────────────┘                               │  WebSocket       │
+                                                  └────────┬─────────┘
+                                                           │ HTTP / WS
+                                 optional SSH mgmt         │
+┌─────────────────┐ ───────────────────────────────────────┘
 │ Router Target   │  firmware / interfaces / firewall / counters
 └─────────────────┘
-                                      ┌────────┴─────────┐
-                                      │  Frontend (React) │
-                                      │  SnortVision UI   │
-                                      └──────────────────┘
-```
-
-## Quick Start
-
-```bash
-cp .env.example .env
-# Edit .env with your Snort host IP, SSH credentials, etc.
-docker compose up -d --build
-# Open http://localhost:3000
-```
-
-## Simulation Mode
-
-SnortVision runs in **simulation mode** by default (no backend required). Click "Simulate" on the DDoS page to trigger attack scenarios. Connect to a real backend to switch to live data.
-
-## Pages
-
-| Page | Description |
-|------|-------------|
-| Dashboard | Stats, live traffic chart, category/severity bars, GeoIP attack map |
-| Alerts | Searchable alert table with severity filters |
-| IP Blocklist | Auto-block engine + manual blocks |
-| DDoS Mitigation | Rate limiting, SYN cookies, geo-blocking, null routing |
-| Rules | Snort rule editor with live preview |
-| Notifications | Telegram, Email, Jira, Slack integrations |
-| Connection | Sensor SSH, router management target, backend dependency chain, credential verification |
-## Real traffic counters
-
-To make the dashboard use real packet counters instead of demo traffic, set these in `.env` before deploy:
-
-```env
-SENSOR_INTERFACE=eth0
-DDOS_PACKET_PPS_THRESHOLD=8000
-DDOS_ALERT_RATE_THRESHOLD=20
-```
-
-`SENSOR_INTERFACE` must be the real sniffing interface on the Snort sensor, such as `eth1`, `ens18`, or the mirrored-port NIC.
+                                                  ┌────────┴─────────┐
+                                                  │ Frontend (React) │
+                                                  │ SnortVision UI   │
+                                                  └──────────────────┘
