@@ -218,6 +218,7 @@ function GeoMap({ alerts }) {
   const pulsesRef  = useRef([]);   // v0.1: impact pulses at home
   const animRef    = useRef(null);
   const frameRef   = useRef(0);
+  const [mapReady, setMapReady] = useState(false);
 
   // Returns true for RFC1918 / loopback / link-local addresses
   function isPrivateIp(ip) {
@@ -287,13 +288,7 @@ function GeoMap({ alerts }) {
         .bindPopup("<b style='color:#16a34a'>🏠 Your Server</b><br>Luxembourg");
 
       leafRef.current = map;
-
-      // Seed initial lines
-      alerts.slice(0,15).forEach(a=>{
-        const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
-        if(!coord) return;
-        spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 0.5+Math.random()*0.5);
-      });
+      setMapReady(true);
 
       // Animate lines
       const animateLines = ()=>{
@@ -375,25 +370,45 @@ function GeoMap({ alerts }) {
     return ()=>{ cancelAnimationFrame(animRef.current); leafRef.current?.remove(); leafRef.current=null; };
   },[]);
 
-  // Spawn new line when new alert comes in
+  // Plot markers + seed lines for ALL external alerts whenever alerts load or map becomes ready.
+  // This fixes the race condition where alerts arrive before Leaflet finishes initialising.
+  const seededIdsRef = useRef(new Set());
+  useEffect(()=>{
+    if(!mapReady || !leafRef.current || !window.L) return;
+    const L = window.L;
+    let newLinesSpawned = 0;
+    alerts.slice(0, 200).forEach(a=>{
+      if(isPrivateIp(a.src_ip)) return;
+      const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
+      if(!coord) return;
+      // Add marker if not already on map
+      const mk = a.country || `ip_${a.src_ip}`;
+      if(!markersRef.current[mk]) {
+        const sev = SEV[a.severity]||SEV.info;
+        const icon = L.divIcon({
+          className:"",
+          html:`<div style="width:10px;height:10px;border-radius:50%;background:${sev.color};border:1.5px solid rgba(0,0,0,0.3);box-shadow:0 0 8px ${sev.color}80"></div>`,
+          iconSize:[10,10], iconAnchor:[5,5]
+        });
+        markersRef.current[mk] = L.marker(coord,{icon}).addTo(leafRef.current)
+          .bindPopup(`<b style="color:${sev.color}">${FLAG[a.country]||"🌐"} ${a.country||a.src_ip}</b><br>${a.src_ip}`);
+      }
+      // Seed up to 15 animated lines for alerts not yet seeded
+      if(!seededIdsRef.current.has(a.id) && newLinesSpawned < 15) {
+        seededIdsRef.current.add(a.id);
+        newLinesSpawned++;
+        spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 0.4+Math.random()*0.6);
+      }
+    });
+  },[mapReady, alerts.length]);
+
+  // Also spawn a fresh line + pulse for the very latest alert (real-time feel)
   useEffect(()=>{
     const a = alerts[0];
-    if(!a||!leafRef.current) return;
+    if(!a || !leafRef.current || isPrivateIp(a.src_ip)) return;
     const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
     if(!coord) return;
     spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 1);
-    // Update/add attacker marker
-    const cc = a.country || `ip_${a.src_ip}`;
-    if(!markersRef.current[cc] && window.L && leafRef.current) {
-      const sev = SEV[a.severity]||SEV.info;
-      const icon = window.L.divIcon({
-        className:"",
-        html:`<div style="width:10px;height:10px;border-radius:50%;background:${sev.color};border:1.5px solid rgba(0,0,0,0.3);box-shadow:0 0 8px ${sev.color}"></div>`,
-        iconSize:[10,10], iconAnchor:[5,5]
-      });
-      markersRef.current[cc] = window.L.marker(coord,{icon}).addTo(leafRef.current)
-        .bindPopup(`<b style="color:${sev.color}">${FLAG[a.country]||"🌐"} ${a.country||a.src_ip}</b><br>${a.src_ip}`);
-    }
   },[alerts.length]);
 
   function spawnLine(fromCoord, color, alpha=1) {
