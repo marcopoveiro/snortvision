@@ -219,11 +219,24 @@ function GeoMap({ alerts }) {
   const animRef    = useRef(null);
   const frameRef   = useRef(0);
 
-  // Top attackers derived from alerts — include alerts with no GeoIP (private/unresolved IPs)
+  // Returns true for RFC1918 / loopback / link-local addresses
+  function isPrivateIp(ip) {
+    if (!ip) return true;
+    const p = ip.split(".").map(Number);
+    if (p.length < 4) return true;
+    return p[0] === 10 ||
+      p[0] === 127 ||
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+      (p[0] === 192 && p[1] === 168) ||
+      (p[0] === 169 && p[1] === 254) ||
+      p[0] === 0;
+  }
+
+  // Top attackers — external IPs only
   const topAttackers = Object.entries(
     alerts.slice(0,500).reduce((a,x)=>{
-      const key = x.country || (x.src_ip && !x.src_ip.startsWith("0.") ? `ip:${x.src_ip}` : null);
-      if(!key) return a;
+      if(isPrivateIp(x.src_ip)) return a;   // skip internal traffic
+      const key = x.country || `ip:${x.src_ip}`;
       if(!a[key]) a[key]={country:x.country||"??",src_ip:x.src_ip||"",hits:0,blocked:0,lastSev:x.severity};
       a[key].hits++;
       if(x.action==="BLOCKED") a[key].blocked++;
@@ -232,15 +245,10 @@ function GeoMap({ alerts }) {
     },{})
   ).map(([,v])=>v).sort((a,b)=>b.hits-a.hits).slice(0,8);
 
-  // Derive a rough coordinate from an IP address (for private/unresolved IPs)
+  // Derive a rough coordinate from an IP address (public IPs only — private IPs return null)
   function coordFromIp(ip) {
-    if (!ip) return null;
+    if (!ip || isPrivateIp(ip)) return null;
     const parts = ip.split(".").map(Number);
-    if (parts.length < 4 || parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168)) {
-      // Private IP — scatter around home with a small offset so it's visible
-      return [HOME_COORD[0] + (parts[3] % 10) - 5, HOME_COORD[1] + (parts[2] % 10) - 5];
-    }
-    // Map to a rough world position based on first octet
     const lat = ((parts[1] || 0) / 255) * 150 - 75;
     const lng = ((parts[0] || 0) / 255) * 360 - 180;
     return [lat, lng];
@@ -1572,7 +1580,14 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
   const ddosAlerts = alerts.filter(a=>a.category==="DDOS").sort((a,b)=>toAlertTimeMs(b.ts)-toAlertTimeMs(a.ts));
   const recentDdos = ddosAlerts.slice(0, 25);
   const ddosSources = Object.values(ddosAlerts.reduce((acc, alert) => {
-    const key = alert.src_ip || "unknown";
+    if(!alert.src_ip || alert.src_ip === "unknown") return acc;
+    // External IPs only — internal traffic is not a DDoS source
+    const parts = alert.src_ip.split(".").map(Number);
+    const isPrivate = parts[0]===10 || parts[0]===127 ||
+      (parts[0]===172&&parts[1]>=16&&parts[1]<=31) ||
+      (parts[0]===192&&parts[1]===168) || parts[0]===0;
+    if(isPrivate) return acc;
+    const key = alert.src_ip;
     if (!acc[key]) acc[key] = { ip:key, hits:0, lastTs:alert.ts, lastMsg:alert.msg, severity:alert.severity, blocked:0 };
     acc[key].hits += 1;
     acc[key].lastTs = alert.ts;
@@ -1581,17 +1596,6 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
     if (alert.action === "BLOCKED") acc[key].blocked += 1;
     return acc;
   }, {})).sort((a,b)=>b.hits-a.hits).slice(0, 8);
-
-  const mitigationLog = blocklist
-    .filter((entry) => String(entry.source || "").toLowerCase() === "ddos" || String(entry.reason || "").toLowerCase().includes("ddos"))
-    .map((entry) => ({
-      ts: entry.added,
-      type: entry.active ? "AUTO_BLOCK" : "PAUSED",
-      msg: `${entry.ip} — ${entry.reason || "DDoS protection"}`,
-      status: entry.active ? "active" : "paused",
-      hits: entry.hits || 0,
-    }))
-    .sort((a,b)=>toAlertTimeMs(b.ts)-toAlertTimeMs(a.ts));
 
   const pps = Number(backendStats?.packet_pps ?? traffic[traffic.length-1]?.pps ?? 0);
   const realDdosDetected = !!backendStats?.ddos_detected;
@@ -1602,7 +1606,32 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
   const mitTypeColor = { RATE_LIMIT:"#0a84ff", AUTO_BLOCK:"#ff2d55", GEO_BLOCK:"#ffd60a", SYN_COOKIE:"#30d158", NULL_ROUTE:"#bf5af2", PAUSED:"#8e8e93" };
   const mitTypeIcon  = { RATE_LIMIT:"⚡", AUTO_BLOCK:"🚫", GEO_BLOCK:"🌍", SYN_COOKIE:"🍪", NULL_ROUTE:"⬛", PAUSED:"⏸" };
 
-  // Keep offline demo only when backend is not driving real data.
+  // Track when current DDoS event started so we don't duplicate system-action entries
+  const ddosStartRef = useRef(null);
+  useEffect(()=>{
+    if(isDdos && !ddosStartRef.current) ddosStartRef.current = new Date().toISOString();
+    if(!isDdos) ddosStartRef.current = null;
+  },[isDdos]);
+
+  // ── Real auto-block: when genuinely connected and DDoS detected in AUTO mode,
+  //    add top attacker IPs to the blocklist (deduped, max every 15 s per IP).
+  const autoBlockedRef = useRef(new Set());
+  useEffect(()=>{
+    if(!realDdosDetected || mitMode !== "auto" || backendStatus !== "connected") return;
+    ddosSources.forEach(src => {
+      if(!src.ip || src.ip === "unknown" || autoBlockedRef.current.has(src.ip)) return;
+      autoBlockedRef.current.add(src.ip);
+      setBlocklist(p => {
+        if(p.some(e => e.ip === src.ip)) return p;
+        return [{ id:Date.now()+Math.random(), ip:src.ip, reason:`DDoS auto-block — ${src.hits} hits`, added:new Date().toISOString(), hits:src.hits, active:true, source:"DDoS" }, ...p];
+      });
+    });
+  },[realDdosDetected, mitMode, backendStatus, ddosSources.length]);
+
+  // Clear auto-block cache when DDoS ends so next event gets fresh blocks
+  useEffect(()=>{ if(!isDdos) autoBlockedRef.current.clear(); },[isDdos]);
+
+  // ── Demo auto-block (offline only)
   useEffect(()=>{
     if(!ddosMode || backendStatus === "connected") return;
     const t = setInterval(()=>{
@@ -1611,6 +1640,30 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
     }, 4000);
     return ()=>clearInterval(t);
   },[ddosMode, backendStatus, setBlocklist]);
+
+  // ── Build mitigation log: blocklist-derived auto-blocks + active system actions
+  const blocklistActions = blocklist
+    .filter((entry) => String(entry.source || "").toLowerCase() === "ddos" || String(entry.reason || "").toLowerCase().includes("ddos"))
+    .map((entry) => ({
+      ts: entry.added,
+      type: entry.active ? "AUTO_BLOCK" : "PAUSED",
+      msg: `${entry.ip} — ${entry.reason || "DDoS protection"}`,
+      status: entry.active ? "active" : "paused",
+      hits: entry.hits || 0,
+    }));
+
+  // System-level mitigations that are currently active during a DDoS event
+  const systemActions = [];
+  const eventTs = ddosStartRef.current || recentDdos[0]?.ts || new Date().toISOString();
+  if(isDdos && mitMode !== "off") {
+    if(rateLimits.enabled) systemActions.push({ ts:eventTs, type:"RATE_LIMIT",  msg:`PPS cap active — SYN ${rateLimits.synFloodRate}pps / ICMP ${rateLimits.icmpRate}pps / UDP ${rateLimits.udpRate}pps`, status:"active", hits:0 });
+    if(synCookie)          systemActions.push({ ts:eventTs, type:"SYN_COOKIE",  msg:"TCP SYN cookie validation active — blocking SYN flood", status:"active", hits:0 });
+    if(nullRoute)          systemActions.push({ ts:eventTs, type:"NULL_ROUTE",  msg:"Null route (blackhole) applied via iptables", status:"active", hits:0 });
+    if(geoBlock.enabled)   systemActions.push({ ts:eventTs, type:"GEO_BLOCK",   msg:`Geo-block active — dropping traffic from: ${geoBlock.countries.join(", ")}`, status:"active", hits:0 });
+  }
+
+  const mitigationLog = [...systemActions, ...blocklistActions]
+    .sort((a,b)=>toAlertTimeMs(b.ts)-toAlertTimeMs(a.ts));
 
   return (
     <div className="space-y-4">
@@ -1807,10 +1860,15 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
           <Shield size={13} className="text-red-400"/>
           <span className="text-sm font-bold text-white">Mitigation Actions</span>
           <span className="text-xs text-gray-600 ml-1">({mitigationLog.length})</span>
+          {isDdos && mitMode !== "off" && (
+            <span className="ml-auto text-xs font-bold font-mono px-2 py-0.5 rounded" style={{background:"rgba(48,209,88,0.12)",color:"#30d158",border:"1px solid rgba(48,209,88,0.3)"}}>
+              AUTO RESPONDING
+            </span>
+          )}
         </div>
         <div className="max-h-56 overflow-auto">
           {mitigationLog.map((e,i)=>(
-            <div key={`${e.ts}-${e.msg}-${i}`} style={{borderBottom:"1px solid #21262d"}} className="px-3 py-2 flex items-center gap-3 hover:bg-white/[0.02]">
+            <div key={`${e.ts}-${e.type}-${i}`} style={{borderBottom:"1px solid #21262d"}} className="px-3 py-2 flex items-center gap-3 hover:bg-white/[0.02]">
               <span className="text-base w-5 text-center flex-shrink-0">{mitTypeIcon[e.type]||"⚙"}</span>
               <span style={{color:mitTypeColor[e.type]||"#8e8e93"}} className="text-xs font-bold font-mono w-24 flex-shrink-0">{e.type}</span>
               <span className="text-xs text-gray-300 flex-1">{e.msg}</span>
