@@ -910,9 +910,19 @@ const SEV_ORDER = { low: 0, medium: 1, high: 2, critical: 3 };
 function sevAtLeast(a, min) { return (SEV_ORDER[a] || 0) >= (SEV_ORDER[min] || 0); }
 
 // ─── Categorise alert ────────────────────────────────────────────────────────
-function categorise(msg = "") {
+function categorise(msg = "", snortClass = "") {
   const m = msg.toLowerCase();
-  if (m.includes("dos")  || m.includes("flood") || m.includes("loic"))           return { category:"DDOS",    severity:"critical" };
+  const c = (snortClass || "").toLowerCase();
+  // DDoS detection — check message patterns AND snort class field
+  const ddosMsg = m.includes("dos") || m.includes("flood") || m.includes("loic") ||
+    m.includes("syn flood") || m.includes("icmp flood") || m.includes("udp flood") ||
+    m.includes("amplif") || m.includes("reflection") || m.includes("fragmentation") ||
+    m.includes("land") || m.includes("smurf") || m.includes("teardrop") ||
+    m.includes("slowloris") || m.includes("hulk") || m.includes("overload") ||
+    m.includes("brute") || m.includes("rate limit");
+  const ddosClass = c.includes("dos") || c.includes("flood") || c.includes("attempted-dos") ||
+    c.includes("denial") || c.includes("ddos");
+  if (ddosMsg || ddosClass) return { category:"DDOS", severity:"critical" };
   if (m.includes("exploit") || m.includes("shellshock") || m.includes("cve-"))   return { category:"EXPLOIT", severity:"critical" };
   if (m.includes("trojan")  || m.includes("zbot") || m.includes("c2"))           return { category:"TROJAN",  severity:"critical" };
   if (m.includes("malware") || m.includes("dridex"))                              return { category:"MALWARE", severity:"high"     };
@@ -968,7 +978,7 @@ function parseSnortLine(line) {
   try {
     const j = JSON.parse(line.trim());
 
-    const { category, severity } = categorise(j.msg || j.message || "");
+    const { category, severity } = categorise(j.msg || j.message || "", j.class || "");
     const sevMap = { 1: "critical", 2: "high", 3: "medium", 4: "low" };
 
     const src = splitAddrPort(j.src_ap || j.src_addr || j.src_ip || "");
@@ -978,11 +988,15 @@ function parseSnortLine(line) {
     const resolvedSev = sevMap[j.priority] || severity;
     const geo = geoLookup(src.ip || "");
 
+    // Use computed category (which already incorporates j.class via categorise)
+    // This prevents snort class strings like "policy-violation" from hiding real DDoS alerts
+    const resolvedCategory = category;
+
     return {
       ts: normaliseSnortTimestamp(j.timestamp),
       rule: j.rule || (j.sid ? `${j.gid || 1}:${j.sid}` : ruleInfo.ruleText),
       msg: j.msg || j.message || "Unknown alert",
-      category: j.class || category,
+      category: resolvedCategory,
       severity: resolvedSev,
       src_ip: src.ip,
       dst_ip: dst.ip,

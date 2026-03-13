@@ -219,17 +219,32 @@ function GeoMap({ alerts }) {
   const animRef    = useRef(null);
   const frameRef   = useRef(0);
 
-  // Top attackers derived from alerts
+  // Top attackers derived from alerts — include alerts with no GeoIP (private/unresolved IPs)
   const topAttackers = Object.entries(
     alerts.slice(0,500).reduce((a,x)=>{
-      if(!x.country) return a;
-      if(!a[x.country]) a[x.country]={country:x.country,hits:0,blocked:0,lastSev:x.severity};
-      a[x.country].hits++;
-      if(x.action==="BLOCKED") a[x.country].blocked++;
-      a[x.country].lastSev = x.severity;
+      const key = x.country || (x.src_ip && !x.src_ip.startsWith("0.") ? `ip:${x.src_ip}` : null);
+      if(!key) return a;
+      if(!a[key]) a[key]={country:x.country||"??",src_ip:x.src_ip||"",hits:0,blocked:0,lastSev:x.severity};
+      a[key].hits++;
+      if(x.action==="BLOCKED") a[key].blocked++;
+      a[key].lastSev = x.severity;
       return a;
     },{})
   ).map(([,v])=>v).sort((a,b)=>b.hits-a.hits).slice(0,8);
+
+  // Derive a rough coordinate from an IP address (for private/unresolved IPs)
+  function coordFromIp(ip) {
+    if (!ip) return null;
+    const parts = ip.split(".").map(Number);
+    if (parts.length < 4 || parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168)) {
+      // Private IP — scatter around home with a small offset so it's visible
+      return [HOME_COORD[0] + (parts[3] % 10) - 5, HOME_COORD[1] + (parts[2] % 10) - 5];
+    }
+    // Map to a rough world position based on first octet
+    const lat = ((parts[1] || 0) / 255) * 150 - 75;
+    const lng = ((parts[0] || 0) / 255) * 360 - 180;
+    return [lat, lng];
+  }
 
   // Init Leaflet map
   useEffect(()=>{
@@ -267,7 +282,7 @@ function GeoMap({ alerts }) {
 
       // Seed initial lines
       alerts.slice(0,15).forEach(a=>{
-        const coord = COUNTRY_COORDS[a.country];
+        const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
         if(!coord) return;
         spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 0.5+Math.random()*0.5);
       });
@@ -356,11 +371,11 @@ function GeoMap({ alerts }) {
   useEffect(()=>{
     const a = alerts[0];
     if(!a||!leafRef.current) return;
-    const coord = COUNTRY_COORDS[a.country];
+    const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
     if(!coord) return;
     spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 1);
     // Update/add attacker marker
-    const cc = a.country;
+    const cc = a.country || `ip_${a.src_ip}`;
     if(!markersRef.current[cc] && window.L && leafRef.current) {
       const sev = SEV[a.severity]||SEV.info;
       const icon = window.L.divIcon({
@@ -369,7 +384,7 @@ function GeoMap({ alerts }) {
         iconSize:[10,10], iconAnchor:[5,5]
       });
       markersRef.current[cc] = window.L.marker(coord,{icon}).addTo(leafRef.current)
-        .bindPopup(`<b style="color:${sev.color}">${FLAG[cc]||"🌐"} ${cc}</b><br>${a.src_ip}`);
+        .bindPopup(`<b style="color:${sev.color}">${FLAG[a.country]||"🌐"} ${a.country||a.src_ip}</b><br>${a.src_ip}`);
     }
   },[alerts.length]);
 
@@ -442,11 +457,12 @@ function GeoMap({ alerts }) {
           </div>
           {topAttackers.map(a=>{
             const sev = SEV[a.lastSev]||SEV.info;
+            const label = a.country && a.country !== "??" ? a.country : (a.src_ip || "Unknown");
             return (
-              <div key={a.country}>
+              <div key={a.country||a.src_ip}>
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-sm">{FLAG[a.country]||"🌐"}</span>
-                  <span className="text-xs font-bold text-white font-mono flex-1">{a.country}</span>
+                  <span className="text-xs font-bold text-white font-mono flex-1">{label}</span>
                   <span style={{color:sev.color}} className="text-xs font-mono font-bold">{a.hits}</span>
                   <span className="text-xs text-gray-600 font-mono">{Math.round(a.blocked/Math.max(a.hits,1)*100)}%🛡</span>
                 </div>
@@ -1537,14 +1553,21 @@ function IpBlocklist({ blocklist, setBlocklist, autoBlock, setAutoBlock, backend
 
 // ─── DDOS MITIGATION// ─── DDOS MITIGATION ─────────────────────────────────────────────────────────
 function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, setBlocklist, backendStats, backendStatus }) {
-  const [mitMode,setMitMode]     = useState("auto");    // auto | manual | off
-  const [rateLimits,setRateLimits] = useState({
+  const [mitMode,setMitMode]     = useState(()=>loadSaved("ddos_mitMode","auto"));
+  const [rateLimits,setRateLimits] = useState(()=>loadSaved("ddos_rateLimits",{
     enabled: true, ppsThreshold: 5000, synFloodRate: 500, icmpRate: 200, udpRate: 1000,
     connPerIp: 50, connWindow: 10
-  });
-  const [geoBlock,setGeoBlock]   = useState({ enabled:false, countries:["KP"] });
-  const [synCookie,setSynCookie] = useState(true);
-  const [nullRoute,setNullRoute] = useState(false);
+  }));
+  const [geoBlock,setGeoBlock]   = useState(()=>loadSaved("ddos_geoBlock",{ enabled:false, countries:["KP"] }));
+  const [synCookie,setSynCookie] = useState(()=>loadSaved("ddos_synCookie",true));
+  const [nullRoute,setNullRoute] = useState(()=>loadSaved("ddos_nullRoute",false));
+
+  // Persist DDoS settings so they survive tab switches
+  useEffect(()=>{ saveSetting("ddos_mitMode",    mitMode);    }, [mitMode]);
+  useEffect(()=>{ saveSetting("ddos_rateLimits", rateLimits); }, [rateLimits]);
+  useEffect(()=>{ saveSetting("ddos_geoBlock",   geoBlock);   }, [geoBlock]);
+  useEffect(()=>{ saveSetting("ddos_synCookie",  synCookie);  }, [synCookie]);
+  useEffect(()=>{ saveSetting("ddos_nullRoute",  nullRoute);  }, [nullRoute]);
 
   const ddosAlerts = alerts.filter(a=>a.category==="DDOS").sort((a,b)=>toAlertTimeMs(b.ts)-toAlertTimeMs(a.ts));
   const recentDdos = ddosAlerts.slice(0, 25);
