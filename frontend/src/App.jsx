@@ -246,14 +246,72 @@ function GeoMap({ alerts }) {
     },{})
   ).map(([,v])=>v).sort((a,b)=>b.hits-a.hits).slice(0,8);
 
-  // Derive a rough coordinate from an IP address (public IPs only — private IPs return null)
-  function coordFromIp(ip) {
-    if (!ip || isPrivateIp(ip)) return null;
-    const parts = ip.split(".").map(Number);
-    const lat = ((parts[1] || 0) / 255) * 150 - 75;
-    const lng = ((parts[0] || 0) / 255) * 360 - 180;
-    return [lat, lng];
+  // ── Real GeoIP cache: ip → { lat, lon, country, countryCode, city }
+  const geoCacheRef = useRef({});   // persisted in memory for session
+  const [geoCache, setGeoCache] = useState(()=>{
+    try { return JSON.parse(sessionStorage.getItem("sv_geocache")||"{}"); } catch { return {}; }
+  });
+
+  // Batch-resolve IPs we haven't seen yet via ip-api.com (free, no key, HTTPS batch)
+  const pendingGeoRef = useRef(new Set());
+  async function resolveGeoIps(ips) {
+    const unknown = ips.filter(ip=> ip && !isPrivateIp(ip) && !geoCacheRef.current[ip] && !pendingGeoRef.current.has(ip));
+    if(!unknown.length) return;
+    unknown.forEach(ip=>pendingGeoRef.current.add(ip));
+    try {
+      // Batch up to 100 at a time
+      for(let i=0; i<unknown.length; i+=100) {
+        const batch = unknown.slice(i, i+100);
+        const res = await fetch("http://ip-api.com/batch?fields=status,query,lat,lon,country,countryCode,city", {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify(batch.map(q=>({query:q})))
+        });
+        if(!res.ok) throw new Error("ip-api HTTP "+res.status);
+        const data = await res.json();
+        const updates = {};
+        data.forEach(r=>{
+          if(r.status==="success") {
+            const entry = { lat:r.lat, lon:r.lon, country:r.country, countryCode:r.countryCode, city:r.city };
+            geoCacheRef.current[r.query] = entry;
+            updates[r.query] = entry;
+          }
+        });
+        if(Object.keys(updates).length) {
+          setGeoCache(prev=>{
+            const next = {...prev,...updates};
+            try { sessionStorage.setItem("sv_geocache", JSON.stringify(next)); } catch {}
+            return next;
+          });
+        }
+        batch.forEach(ip=>pendingGeoRef.current.delete(ip));
+      }
+    } catch(e) {
+      console.warn("[GeoIP] ip-api.com lookup failed:", e.message);
+      unknown.forEach(ip=>pendingGeoRef.current.delete(ip));
+    }
   }
+
+  // Sync geoCacheRef whenever geoCache state updates (for synchronous reads inside effects)
+  useEffect(()=>{ geoCacheRef.current = {...geoCacheRef.current, ...geoCache}; },[geoCache]);
+
+  // Returns [lat, lon] for an IP — from backend GeoIP, real ip-api cache, or null
+  function coordForAlert(alert) {
+    if(!alert) return null;
+    // 1. Use backend-resolved country coord if we have it
+    if(alert.country && COUNTRY_COORDS[alert.country]) return COUNTRY_COORDS[alert.country];
+    // 2. Use ip-api resolved exact coordinates
+    const cached = geoCacheRef.current[alert.src_ip];
+    if(cached) return [cached.lat, cached.lon];
+    return null;
+  }
+
+  // Kick off geo lookups for all external IPs in current alerts
+  useEffect(()=>{
+    const externalIps = [...new Set(alerts.filter(a=>!isPrivateIp(a.src_ip)).map(a=>a.src_ip).filter(Boolean))];
+    if(externalIps.length) resolveGeoIps(externalIps);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[alerts.length]);
 
   // Init Leaflet map
   useEffect(()=>{
@@ -370,8 +428,8 @@ function GeoMap({ alerts }) {
     return ()=>{ cancelAnimationFrame(animRef.current); leafRef.current?.remove(); leafRef.current=null; };
   },[]);
 
-  // Plot markers + seed lines for ALL external alerts whenever alerts load or map becomes ready.
-  // This fixes the race condition where alerts arrive before Leaflet finishes initialising.
+  // Plot markers + seed lines for ALL external alerts whenever alerts load, map becomes ready,
+  // or geoCache gains new entries (IPs resolved after initial render).
   const seededIdsRef = useRef(new Set());
   useEffect(()=>{
     if(!mapReady || !leafRef.current || !window.L) return;
@@ -379,34 +437,36 @@ function GeoMap({ alerts }) {
     let newLinesSpawned = 0;
     alerts.slice(0, 200).forEach(a=>{
       if(isPrivateIp(a.src_ip)) return;
-      const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
-      if(!coord) return;
-      // Add marker if not already on map
-      const mk = a.country || `ip_${a.src_ip}`;
+      const coord = coordForAlert(a);
+      if(!coord) return;   // not resolved yet — will re-run when geoCache updates
+      // Add / update marker — use src_ip as key for precision (not country, multiple IPs per country)
+      const mk = `ip_${a.src_ip}`;
       if(!markersRef.current[mk]) {
         const sev = SEV[a.severity]||SEV.info;
+        const cached = geoCacheRef.current[a.src_ip];
+        const label = cached ? `${cached.city ? cached.city+", " : ""}${cached.country||a.country||a.src_ip}` : (a.country||a.src_ip);
         const icon = L.divIcon({
           className:"",
           html:`<div style="width:10px;height:10px;border-radius:50%;background:${sev.color};border:1.5px solid rgba(0,0,0,0.3);box-shadow:0 0 8px ${sev.color}80"></div>`,
           iconSize:[10,10], iconAnchor:[5,5]
         });
         markersRef.current[mk] = L.marker(coord,{icon}).addTo(leafRef.current)
-          .bindPopup(`<b style="color:${sev.color}">${FLAG[a.country]||"🌐"} ${a.country||a.src_ip}</b><br>${a.src_ip}`);
+          .bindPopup(`<b style="color:${sev.color}">${FLAG[a.country]||"🌐"} ${label}</b><br><span style="color:#8e8e93">${a.src_ip}</span>`);
       }
-      // Seed up to 15 animated lines for alerts not yet seeded
+      // Seed animated lines for alerts not yet seeded
       if(!seededIdsRef.current.has(a.id) && newLinesSpawned < 15) {
         seededIdsRef.current.add(a.id);
         newLinesSpawned++;
         spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 0.4+Math.random()*0.6);
       }
     });
-  },[mapReady, alerts.length]);
+  },[mapReady, alerts.length, geoCache]);
 
-  // Also spawn a fresh line + pulse for the very latest alert (real-time feel)
+  // Spawn a fresh line for the very latest alert as it arrives
   useEffect(()=>{
     const a = alerts[0];
     if(!a || !leafRef.current || isPrivateIp(a.src_ip)) return;
-    const coord = COUNTRY_COORDS[a.country] || coordFromIp(a.src_ip);
+    const coord = coordForAlert(a);
     if(!coord) return;
     spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 1);
   },[alerts.length]);
