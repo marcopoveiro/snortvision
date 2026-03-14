@@ -455,6 +455,8 @@ function buildSshOptions(cfg = getConnConfig()) {
     port: parseInt(cfg.port || "22"),
     username: cfg.user || "snort",
     readyTimeout: 10000,
+    keepaliveInterval: 15000,
+    keepaliveCountMax: 4,
   };
 
   if (cfg.authMode === "SSH Key") {
@@ -1158,29 +1160,57 @@ function startTail(onLine) {
     return;
   }
 
+  // Guard: prevent double-reconnect if both stream.close and ssh.close fire
+  let reconnectScheduled = false;
+  function scheduleReconnect(delayMs, reason) {
+    if (reconnectScheduled) return;
+    reconnectScheduled = true;
+    if (sshClient === ssh) sshClient = null;
+    try { ssh.end(); } catch (_) {}
+    console.log(`[SSH] ${reason} — reconnecting in ${delayMs / 1000}s…`);
+    setTimeout(() => startTail(onLine), delayMs);
+  }
+
   ssh.on("ready", () => {
     console.log(`[SSH] Connected → ${cfg.ip}  tailing ${cfg.logPath}`);
-    ssh.exec(`tail -F "${cfg.logPath}"`, (err, stream) => {
-      if (err) { console.error("[SSH] exec:", err.message); return; }
+    // Use shell() instead of exec() — shell sessions are persistent and survive
+    // server-side exec timeouts that kill long-running exec channels.
+    ssh.shell({ term: "dumb", rows: 24, cols: 200 }, (err, stream) => {
+      if (err) {
+        console.error("[SSH] shell:", err.message);
+        scheduleReconnect(5000, "shell open failed");
+        return;
+      }
       let buf = "";
       stream.on("data", d => {
         buf += d.toString();
         const lines = buf.split("\n");
         buf = lines.pop();
-        for (const l of lines) { if (l.trim()) onLine(l); }
+        for (const l of lines) {
+          const t = l.trim();
+          // Skip shell prompts and the echo of our own command
+          if (!t || t.startsWith("tail -F") || t.match(/^[\w@.~$#%>\]]+\s*[\$#>]\s*$/)) continue;
+          onLine(t);
+        }
       });
-      stream.stderr.on("data", d => console.warn("[SSH stderr]", d.toString().trim()));
-      stream.on("close", () => {
-        console.log("[SSH] Stream closed — reconnecting in 5s…");
-        setTimeout(() => startTail(onLine), 5000);
+      stream.stderr.on("data", d => {
+        const msg = d.toString().trim();
+        if (msg && !msg.includes("file truncated")) console.warn("[SSH stderr]", msg);
       });
+      stream.on("close", () => scheduleReconnect(5000, "stream closed"));
+      // Send the tail command into the shell
+      stream.write(`tail -n 0 -F "${cfg.logPath}"\n`);
     });
   });
 
   ssh.on("error", err => {
     console.error("[SSH] Error:", err.message);
-    setTimeout(() => startTail(onLine), 10000);
+    scheduleReconnect(10000, `error: ${err.message}`);
   });
+
+  // Connection-level close (TCP dropped, keepalive timeout, etc.)
+  ssh.on("close", () => scheduleReconnect(5000, "connection closed"));
+  ssh.on("end",   () => scheduleReconnect(5000, "connection ended"));
 
   ssh.connect(opts);
 }
