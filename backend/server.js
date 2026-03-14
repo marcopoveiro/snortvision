@@ -1220,7 +1220,17 @@ const app    = express();
 const server = http.createServer(app);
 const wss    = new WebSocketServer({ server, path: "/ws" });
 
-app.use(cors());
+// Allow requests from any origin that the frontend might be served from.
+// Set CORS_ORIGIN env var to restrict (e.g. https://snort.rodrigues.lu).
+// Default '*' keeps local dev working out of the box.
+const corsOrigin = process.env.CORS_ORIGIN || '*';
+app.use(cors({
+  origin: corsOrigin === '*' ? '*' : corsOrigin.split(',').map(s => s.trim()),
+  credentials: corsOrigin !== '*',
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','x-api-key'],
+}));
+app.options('*', cors());
 app.use(express.json());
 
 const FRONTEND_DIST = path.resolve(__dirname, "..", "frontend", "dist");

@@ -2648,18 +2648,28 @@ function saveSetting(key, value) {
 }
 
 function getDefaultBackendUrl() {
+  // 1. Explicit build-time override (VITE_BACKEND_URL in .env)
   const envUrl = typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_BACKEND_URL
     ? String(import.meta.env.VITE_BACKEND_URL).trim()
     : "";
   if (envUrl) return envUrl;
 
   if (typeof window !== "undefined") {
-    const proto = window.location.protocol === "https:" ? "https:" : "http:";
-    const host = window.location.hostname || "localhost";
-    const port = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_BACKEND_PORT)
+    // 2. When served via a reverse proxy (nginx/NPM) the frontend nginx.conf
+    //    already proxies /api/ and /ws to the backend container.
+    //    Use same-origin (no port) so it works both on LAN (:3000) and via domain (HTTPS).
+    const port = window.location.port;
+    // Only append :4000 if accessing the raw Vite dev server (port 5173)
+    // or an explicit VITE_BACKEND_PORT override.
+    const vitePort = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_BACKEND_PORT)
       ? String(import.meta.env.VITE_BACKEND_PORT).trim()
-      : "4000";
-    return `${proto}//${host}:${port}`;
+      : "";
+    if (vitePort) {
+      const proto = window.location.protocol === "https:" ? "https:" : "http:";
+      return `${proto}//${window.location.hostname}:${vitePort}`;
+    }
+    // Same-origin: nginx in the frontend container handles the /api/ proxy
+    return window.location.origin;
   }
 
   return "http://localhost:4000";
@@ -2686,7 +2696,19 @@ export default function SnortVision() {
   // ── Backend connection state (lifted here so Connection panels share it)
   const [backendUrl,setBackendUrl]   = useState(()=>{
     const saved = loadSaved("backendUrl", "");
-    if (saved && !String(saved).includes("192.168.10.50")) return saved;
+    if (saved) {
+      try {
+        const u = new URL(saved);
+        // Strip any saved URL that hardcodes :4000 on a non-localhost host
+        // (would fail behind a reverse proxy). Use same-origin instead.
+        if (u.port === "4000" && u.hostname !== "localhost" && u.hostname !== "127.0.0.1") {
+          return getDefaultBackendUrl();
+        }
+        // Discard stale default placeholder IPs
+        if (u.hostname === "192.168.10.50") return getDefaultBackendUrl();
+        return saved;
+      } catch { /* invalid URL saved — fall through */ }
+    }
     return getDefaultBackendUrl();
   });
   const [apiKey,setApiKey]           = useState(()=>loadSaved("apiKey",""));
