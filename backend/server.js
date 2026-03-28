@@ -2491,10 +2491,50 @@ app.delete("/api/alerts", auth, (req, res) => {
 });
 
 // Public — no auth — lets the frontend recover backendUrl after localStorage clear
-// ─── GeoIP proxy — browser calls this instead of ip-api.com directly ────────────
-// This avoids HTTPS mixed-content blocks when the frontend is served over HTTPS.
-// Falls back to geoip-lite if installed, then ip-api.com server-side.
+// ─── GeoIP proxy — multi-source with accuracy fallback chain ─────────────────
+// Sources tried in order: ipwho.is (primary, HTTPS, accurate for CDN IPs)
+//                         ip-api.com (fallback batch, HTTP but server-side = safe)
+//                         geoip-lite (offline last resort)
+// Results cached in memory for the lifetime of the container.
 const geoProxyCache = {};
+
+// Single-IP lookup via ipwho.is — free, HTTPS, no key, accurate for Cloudflare/CDN
+async function lookupIpWhoIs(ip) {
+  try {
+    const r = await fetch(`https://ipwho.is/${ip}`, {
+      headers: { "Accept": "application/json" },
+      signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined,
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (!d.success || !d.latitude) return null;
+    return {
+      ip,
+      lat:     d.latitude,
+      lon:     d.longitude,
+      country: d.country || "",
+      city:    d.city    || "",
+      cc:      d.country_code || "",
+    };
+  } catch { return null; }
+}
+
+// Batch lookup via ip-api.com — HTTP only (safe server-side), good for most IPs
+async function lookupIpApiBatch(ips) {
+  try {
+    const r = await fetch("http://ip-api.com/batch?fields=status,query,lat,lon,country,countryCode,city", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ips.map(q => ({ query: q }))),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+    });
+    if (!r.ok) return [];
+    const data = await r.json();
+    return data
+      .filter(d => d.status === "success" && d.lat)
+      .map(d => ({ ip: d.query, lat: d.lat, lon: d.lon, country: d.country || "", city: d.city || "", cc: d.countryCode || "" }));
+  } catch { return []; }
+}
 
 app.post("/api/public/geoip", async (req, res) => {
   const ips = (req.body?.ips || []).filter(ip => ip && typeof ip === "string").slice(0, 100);
@@ -2503,9 +2543,9 @@ app.post("/api/public/geoip", async (req, res) => {
   const results = [];
   const needRemote = [];
 
+  // Stage 1: memory cache + geoip-lite
   for (const ip of ips) {
     if (geoProxyCache[ip]) { results.push(geoProxyCache[ip]); continue; }
-    // Try geoip-lite first (instant, offline)
     const local = geoLookup(ip);
     if (local.country && local.lat && local.lon) {
       const entry = { ip, lat: local.lat, lon: local.lon, country: local.country, city: local.city || "", cc: local.country };
@@ -2515,32 +2555,42 @@ app.post("/api/public/geoip", async (req, res) => {
     }
   }
 
-  if (needRemote.length) {
-    try {
-      const r = await fetch("http://ip-api.com/batch?fields=status,query,lat,lon,country,countryCode,city", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(needRemote.map(q => ({ query: q }))),
-        signal: AbortSignal.timeout(8000),
-      });
-      if (r.ok) {
-        const data = await r.json();
-        data.forEach(d => {
-          if (d.status === "success") {
-            const entry = { ip: d.query, lat: d.lat, lon: d.lon, country: d.country, city: d.city || "", cc: d.countryCode };
-            geoProxyCache[d.query] = entry;
-            results.push(entry);
-          } else {
-            results.push({ ip: d.query, lat: null, lon: null, country: "", city: "", cc: "" });
-          }
-        });
-      }
-    } catch(e) {
-      console.warn("[GeoIP proxy] ip-api.com failed:", e.message);
-      needRemote.forEach(ip => results.push({ ip, lat: null, lon: null, country: "", city: "", cc: "" }));
+  if (!needRemote.length) return res.json({ results });
+
+  // Stage 2: ipwho.is (primary — HTTPS, accurate for CDN/Cloudflare IPs)
+  // Run concurrently, max 5 at once to respect rate limits
+  const ipwhoisResults = {};
+  const batchSize = 5;
+  for (let i = 0; i < needRemote.length; i += batchSize) {
+    const batch = needRemote.slice(i, i + batchSize);
+    const resolved = await Promise.all(batch.map(lookupIpWhoIs));
+    resolved.forEach((entry, idx) => {
+      if (entry) ipwhoisResults[batch[idx]] = entry;
+    });
+  }
+
+  const stillNeed = [];
+  for (const ip of needRemote) {
+    if (ipwhoisResults[ip]) {
+      geoProxyCache[ip] = ipwhoisResults[ip];
+      results.push(ipwhoisResults[ip]);
+    } else {
+      stillNeed.push(ip);
     }
   }
 
+  // Stage 3: ip-api.com batch fallback for any IPs ipwho.is couldn't resolve
+  if (stillNeed.length) {
+    const fallback = await lookupIpApiBatch(stillNeed);
+    const fallbackMap = Object.fromEntries(fallback.map(e => [e.ip, e]));
+    for (const ip of stillNeed) {
+      const entry = fallbackMap[ip] || { ip, lat: null, lon: null, country: "", city: "", cc: "" };
+      if (entry.lat) geoProxyCache[ip] = entry;
+      results.push(entry);
+    }
+  }
+
+  console.log(`[GeoIP] Resolved ${results.filter(r=>r.lat).length}/${ips.length} IPs — cache size: ${Object.keys(geoProxyCache).length}`);
   res.json({ results });
 });
 
