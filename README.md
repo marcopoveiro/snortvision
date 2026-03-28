@@ -390,11 +390,8 @@ SnortVision is built and maintained as part of a homelab SOC in **Luxembourg** r
 
 - **Snort 3** on a dedicated sensor VM (Proxmox VE)
 - **Wazuh** SIEM with n8n + Telegram automation
-- **Zabbix** infrastructure monitoring
-- **OpenWRT** routers (GL.iNet Flint 3 / SCORPION)
-- **Home Assistant** with solar, EV, and camera integration
 
-The project is developed as part of teaching cybersecurity at the **Chambre de Commerce Luxembourg** and through **Level200 (LLLC)** IT consulting.
+
 
 ---
 
