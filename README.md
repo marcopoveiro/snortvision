@@ -238,7 +238,7 @@ FRONTEND_PORT=3000
 BACKEND_PORT=4000
 
 # ── Snort Sensor (SSH) ────────────────────────────────────────────────
-SNORT_HOST=192.168.1.72
+SNORT_HOST=192.168.1.xx
 SNORT_SSH_PORT=22
 SNORT_SSH_USER=snort
 SNORT_AUTH_MODE=SSH Key          # SSH Key | Password
@@ -315,7 +315,7 @@ https://yourdomain.lu
 ssh-keygen -t ed25519 -f ./keys/snort_id_rsa -N ""
 
 # Copy public key to Snort sensor
-ssh-copy-id -i ./keys/snort_id_rsa.pub snort@192.168.1.72
+ssh-copy-id -i ./keys/snort_id_rsa.pub user@192.168.1.xx
 
 # The private key is mounted read-only into the backend container
 # via the ./keys volume in docker-compose.yml
