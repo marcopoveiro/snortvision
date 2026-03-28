@@ -184,383 +184,502 @@ function ActionStatePill({ type, msg, className = "" }) {
 }
 
 // ─── GeoIP Map (Leaflet) — v0.1: Voyager tiles + attack impact pulses ──────
+// Expanded country coords used by 3D map
 const COUNTRY_COORDS = {
   CN:[35.86,104.19],RU:[61.52,105.31],US:[37.09,-95.71],KP:[40.34,127.51],
   IR:[32.42,53.68], BR:[-14.23,-51.92],IN:[20.59,78.96], NG:[9.08,8.67],
   DE:[51.16,10.45], FR:[46.22,2.21],  GB:[55.37,-3.43], JP:[36.20,138.25],
   AU:[-25.27,133.77],MX:[23.63,-102.55],ZA:[-30.55,22.93],UA:[48.37,31.16],
-  US_HOME:[49.61,6.13], // Luxembourg — home server default
+  CA:[56.13,-106.34],IT:[41.87,12.56],ES:[40.46,-3.74],NL:[52.13,5.29],
+  BE:[50.50,4.47], PL:[51.92,19.14], TR:[38.96,35.24],SA:[23.88,45.08],
+  AR:[-38.42,-63.62],CL:[-35.68,-71.54],CO:[4.57,-74.30],EG:[26.82,30.80],
+  PK:[30.37,69.34], BD:[23.68,90.36], VN:[14.06,108.28],MY:[4.21,108.96],
+  ID:[-0.79,113.92], TH:[15.87,100.99],PH:[12.88,121.77],KR:[35.91,127.77],
+  TW:[23.69,120.96], SG:[1.35,103.82], HK:[22.32,114.17],IL:[31.05,34.85],
+  SE:[60.12,18.64],  NO:[60.47,8.47],  DK:[56.26,9.50], FI:[61.92,25.75],
+  CH:[46.82,8.23],   AT:[47.51,14.55], CZ:[49.82,15.47],HU:[47.16,19.50],
+  RO:[45.94,24.96],  BG:[42.73,25.48], GR:[39.07,21.82],PT:[39.40,-8.22],
+  RS:[44.02,21.01],  HR:[45.10,15.20], SK:[48.67,19.70],UA:[48.37,31.16],
+  LU:[49.61,6.13],   LV:[56.88,24.60], LT:[55.17,23.88],EE:[58.59,25.01],
 };
 const HOME_COORD = [49.61, 6.13]; // Luxembourg
-const FLAG = {CN:"🇨🇳",RU:"🇷🇺",US:"🇺🇸",KP:"🇰🇵",IR:"🇮🇷",BR:"🇧🇷",IN:"🇮🇳",NG:"🇳🇬",DE:"🇩🇪",FR:"🇫🇷",GB:"🇬🇧",JP:"🇯🇵",AU:"🇦🇺",MX:"🇲🇽",ZA:"🇿🇦",UA:"🇺🇦"};
+const FLAG = {CN:"🇨🇳",RU:"🇷🇺",US:"🇺🇸",KP:"🇰🇵",IR:"🇮🇷",BR:"🇧🇷",IN:"🇮🇳",NG:"🇳🇬",DE:"🇩🇪",FR:"🇫🇷",GB:"🇬🇧",JP:"🇯🇵",AU:"🇦🇺",MX:"🇲🇽",ZA:"🇿🇦",UA:"🇺🇦",CA:"🇨🇦",IT:"🇮🇹",ES:"🇪🇸",NL:"🇳🇱",BE:"🇧🇪",PL:"🇵🇱",TR:"🇹🇷",SA:"🇸🇦",AR:"🇦🇷",KR:"🇰🇷",TW:"🇹🇼",SG:"🇸🇬",SE:"🇸🇪",NO:"🇳🇴",CH:"🇨🇭",LU:"🇱🇺"};
 
-// Leaflet is loaded via CDN script tag injected once
-let leafletReady = false;
-function ensureLeaflet(cb) {
-  if(window.L) { cb(); return; }
-  if(leafletReady) { const t=setInterval(()=>{if(window.L){clearInterval(t);cb();}},50); return; }
-  leafletReady = true;
-  const css = document.createElement("link");
-  css.rel="stylesheet"; css.href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";
-  document.head.appendChild(css);
-  const js = document.createElement("script");
-  js.src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";
-  js.onload = cb;
-  document.head.appendChild(js);
+// ─── Three.js CDN loader ──────────────────────────────────────────────────────
+let _threeLoading = false;
+const _threeQ = [];
+function ensureThree(cb) {
+  if (window.THREE) { cb(); return; }
+  _threeQ.push(cb);
+  if (_threeLoading) return;
+  _threeLoading = true;
+  const s = document.createElement("script");
+  s.src = "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js";
+  s.onload = () => { _threeQ.forEach(f => f()); _threeQ.length = 0; };
+  document.head.appendChild(s);
 }
 
-function GeoMap({ alerts }) {
-  const mapRef     = useRef(null);
-  const leafRef    = useRef(null);   // L.map instance
-  const svgLayerRef= useRef(null);   // SVG overlay for threat lines
-  const markersRef = useRef({});
-  const linesRef   = useRef([]);
-  const pulsesRef  = useRef([]);   // v0.1: impact pulses at home
-  const animRef    = useRef(null);
-  const frameRef   = useRef(0);
-  const [mapReady, setMapReady] = useState(false);
+// ─── Module-level GeoIP cache for 3D map (persists across re-renders) ────────
+const _geo3d = {};
+const _geo3dPending = new Set();
+// Use backend as GeoIP proxy — avoids HTTPS mixed-content block
+// Falls back to direct ip-api.com only if backend is unavailable
+async function _resolveGeo3d(ips, backendUrl) {
+  const todo = ips.filter(ip => ip && !_isPrivate3d(ip) && !_geo3d[ip] && !_geo3dPending.has(ip));
+  if (!todo.length) return false;
+  todo.forEach(ip => _geo3dPending.add(ip));
+  const base = backendUrl || window.location.origin;
+  try {
+    // Primary: backend proxy (HTTPS-safe, same origin)
+    const res = await fetch(`${base}/api/public/geoip`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ips: todo }),
+    });
+    if (!res.ok) throw new Error("proxy " + res.status);
+    const { results } = await res.json();
+    results.forEach(r => {
+      if (r.lat !== null) _geo3d[r.ip] = { lat: r.lat, lon: r.lon, country: r.country, cc: r.cc, city: r.city };
+    });
+    todo.forEach(ip => _geo3dPending.delete(ip));
+    return true;
+  } catch(e) {
+    console.warn("[GeoIP] backend proxy failed, trying direct:", e.message);
+    try {
+      // Fallback: direct call (works on HTTP deployments)
+      const r2 = await fetch("http://ip-api.com/batch?fields=status,query,lat,lon,country,countryCode,city", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(todo.map(q => ({ query: q }))),
+      });
+      const data = await r2.json();
+      data.forEach(r => {
+        if (r.status === "success") _geo3d[r.query] = { lat: r.lat, lon: r.lon, country: r.country, cc: r.countryCode, city: r.city };
+      });
+      todo.forEach(ip => _geo3dPending.delete(ip));
+      return true;
+    } catch {
+      todo.forEach(ip => _geo3dPending.delete(ip));
+      return false;
+    }
+  }
+}
+function _isPrivate3d(ip) {
+  if (!ip) return true;
+  const p = ip.split(".").map(Number);
+  return p.length < 4 || p[0] === 10 || p[0] === 127 || p[0] === 0 ||
+    (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+    (p[0] === 192 && p[1] === 168) || (p[0] === 169 && p[1] === 254);
+}
 
-  // Returns true for RFC1918 / loopback / link-local addresses
-  function isPrivateIp(ip) {
-    if (!ip) return true;
-    const p = ip.split(".").map(Number);
-    if (p.length < 4) return true;
-    return p[0] === 10 ||
-      p[0] === 127 ||
-      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
-      (p[0] === 192 && p[1] === 168) ||
-      (p[0] === 169 && p[1] === 254) ||
-      p[0] === 0;
+// ─── 3D Cyberthreat Globe (Kaspersky-style) ───────────────────────────────────
+function GeoMap({ alerts, backendUrl }) {
+  const mountRef = useRef(null);
+  const S = useRef({   // all mutable Three.js state in one object to avoid stale closures
+    scene:null, camera:null, renderer:null, globe:null,
+    arcs:[], markers:{}, rings:[], frame:null,
+    t:0, dragging:false, lastMouse:{x:0,y:0},
+    vel:{x:0,y:0}, autoRot:false, autoTimer:null, ready:false,  // autoRot permanently off
+  });
+  const [geoV, setGeoV] = useState(0);
+
+  const GR = 2; // globe radius
+  const HOME = [49.61, 6.13]; // Luxembourg
+
+  function ll(lat, lon, r) {
+    const phi = (90 - lat) * Math.PI / 180;
+    const th  = (lon + 180) * Math.PI / 180;
+    return new window.THREE.Vector3(
+      -r * Math.sin(phi) * Math.cos(th),
+       r * Math.cos(phi),
+       r * Math.sin(phi) * Math.sin(th)
+    );
   }
 
-  // Top attackers — external IPs only
-  const topAttackers = Object.entries(
-    alerts.slice(0,500).reduce((a,x)=>{
-      if(isPrivateIp(x.src_ip)) return a;   // skip internal traffic
-      const key = x.country || `ip:${x.src_ip}`;
-      if(!a[key]) a[key]={country:x.country||"??",src_ip:x.src_ip||"",hits:0,blocked:0,lastSev:x.severity};
-      a[key].hits++;
-      if(x.action==="BLOCKED") a[key].blocked++;
-      a[key].lastSev = x.severity;
-      return a;
-    },{})
-  ).map(([,v])=>v).sort((a,b)=>b.hits-a.hits).slice(0,8);
+  // ── Init Three.js scene ──────────────────────────────────────────────────────
+  useEffect(() => {
+    ensureThree(() => {
+      const s = S.current;
+      if (s.ready || !mountRef.current) return;
+      s.ready = true;
+      const THREE = window.THREE;
+      const W = mountRef.current.clientWidth, H = 520;
 
-  // ── Real GeoIP cache: ip → { lat, lon, country, countryCode, city }
-  const geoCacheRef = useRef({});   // persisted in memory for session
-  const [geoCache, setGeoCache] = useState(()=>{
-    try { return JSON.parse(sessionStorage.getItem("sv_geocache")||"{}"); } catch { return {}; }
-  });
+      // Core
+      s.scene  = new THREE.Scene();
+      s.camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 200);
+      s.camera.position.z = 5.2;  // slightly closer for more globe presence
+      s.renderer = new THREE.WebGLRenderer({ antialias: true });
+      s.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      s.renderer.setSize(W, H);
+      s.renderer.setClearColor(0x020409);
+      mountRef.current.appendChild(s.renderer.domElement);
 
-  // Batch-resolve IPs we haven't seen yet via ip-api.com (free, no key, HTTPS batch)
-  const pendingGeoRef = useRef(new Set());
-  async function resolveGeoIps(ips) {
-    const unknown = ips.filter(ip=> ip && !isPrivateIp(ip) && !geoCacheRef.current[ip] && !pendingGeoRef.current.has(ip));
-    if(!unknown.length) return;
-    unknown.forEach(ip=>pendingGeoRef.current.add(ip));
-    try {
-      // Batch up to 100 at a time
-      for(let i=0; i<unknown.length; i+=100) {
-        const batch = unknown.slice(i, i+100);
-        const res = await fetch("http://ip-api.com/batch?fields=status,query,lat,lon,country,countryCode,city", {
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body: JSON.stringify(batch.map(q=>({query:q})))
+      // ── Stars (two layers for depth) ──
+      for (const [n, col, sz, r0] of [[5000, 0xaabbee, 0.07, 55], [800, 0x7799ff, 0.05, 52]]) {
+        const verts = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          const th = Math.random() * Math.PI * 2;
+          const ph = Math.acos(2 * Math.random() - 1);
+          const r  = r0 + Math.random() * 30;
+          verts[i*3]   = r * Math.sin(ph) * Math.cos(th);
+          verts[i*3+1] = r * Math.cos(ph);
+          verts[i*3+2] = r * Math.sin(ph) * Math.sin(th);
+        }
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+        s.scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: col, size: sz, transparent: true, opacity: 0.75, sizeAttenuation: true })));
+      }
+
+      // ── Lighting ──
+      s.scene.add(new THREE.AmbientLight(0x0d1933, 3));
+      const sun = new THREE.DirectionalLight(0x4477ff, 2);
+      sun.position.set(8, 4, 6);
+      s.scene.add(sun);
+
+      // ── Globe group ──
+      s.globe = new THREE.Group();
+      // Rotate so Europe (lon ≈ 6°E) faces the camera on load
+      // In our ll() formula lon maps to th=(lon+180)*PI/180, globe x=-r*sin(phi)*cos(th)
+      // To face lon=6° → rotation.y ≈ -(6°)*PI/180 adjusted for texture orientation
+      // Rotation to face Luxembourg (lon=6.13°E) toward camera (+z axis)
+      // Formula: rot.y = -(th_LU - PI/2), where th_LU = (6.13+180)*PI/180 = 3.249
+      s.globe.rotation.y = -1.68;   // places Europe/LU facing camera
+      s.globe.rotation.x =  0.18;   // tilt to show northern hemisphere nicely
+      s.scene.add(s.globe);
+
+      // Base sphere
+      const gMat = new THREE.MeshPhongMaterial({
+        color: 0x060e1f, emissive: 0x020810, specular: 0x0055ff, shininess: 18,
+      });
+      s.globe.add(new THREE.Mesh(new THREE.SphereGeometry(GR, 64, 64), gMat));
+
+      // Load Earth night texture with fallbacks
+      const tl = new THREE.TextureLoader();
+      const tryTex = (urls, i = 0) => {
+        if (i >= urls.length) return;
+        tl.load(urls[i], tex => {
+          gMat.map = tex; gMat.color.set(0xffffff); gMat.needsUpdate = true;
+        }, undefined, () => tryTex(urls, i + 1));
+      };
+      tryTex([
+        "https://unpkg.com/three-globe/example/img/earth-night.jpg",
+        "https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg",
+      ]);
+
+      // Lat/lon grid
+      const gL = new THREE.LineBasicMaterial({ color: 0x0a2550, transparent: true, opacity: 0.2 });
+      for (let lat = -80; lat <= 80; lat += 20) {
+        const pts = []; for (let lon = -180; lon <= 181; lon += 3) pts.push(ll(lat, lon, GR + 0.003));
+        s.globe.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gL.clone()));
+      }
+      for (let lon = -180; lon < 180; lon += 20) {
+        const pts = []; for (let lat = -89; lat <= 89; lat += 3) pts.push(ll(lat, lon, GR + 0.003));
+        s.globe.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gL.clone()));
+      }
+
+      // ── Atmosphere layers ──
+      [[GR*1.02, 0x0044ff, 0.06], [GR*1.055, 0x002299, 0.035], [GR*1.10, 0x001177, 0.018]].forEach(([r, c, o]) => {
+        s.scene.add(new THREE.Mesh(
+          new THREE.SphereGeometry(r, 32, 32),
+          new THREE.MeshPhongMaterial({ color: c, transparent: true, opacity: o, blending: THREE.AdditiveBlending, depthWrite: false })
+        ));
+      });
+      // Rim glow (back side)
+      s.scene.add(new THREE.Mesh(
+        new THREE.SphereGeometry(GR * 1.09, 32, 32),
+        new THREE.MeshPhongMaterial({ color: 0x002299, transparent: true, opacity: 0.12, side: THREE.BackSide, blending: THREE.AdditiveBlending, depthWrite: false })
+      ));
+
+      // ── Home marker — Luxembourg ──
+      const homePos = ll(HOME[0], HOME[1], GR + 0.04);
+      const homeDot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.055, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0x30d158, blending: THREE.AdditiveBlending })
+      );
+      homeDot.position.copy(homePos);
+      s.globe.add(homeDot);
+
+      for (let i = 0; i < 3; i++) {
+        const ring = new THREE.Mesh(
+          new THREE.RingGeometry(0.07*(i+1), 0.07*(i+1)+0.018, 32),
+          new THREE.MeshBasicMaterial({ color: 0x30d158, transparent: true, opacity: 0.4/(i+1), side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false })
+        );
+        ring.position.copy(homePos);
+        ring.lookAt(new THREE.Vector3(0, 0, 0));
+        ring.userData.ri = i;
+        s.globe.add(ring);
+        s.rings.push(ring);
+      }
+
+      // ── Animation loop ──
+      const animate = () => {
+        s.frame = requestAnimationFrame(animate);
+        s.t += 0.016;
+
+        // Rotation
+        // Auto-rotation disabled — globe only moves on drag
+        if (!s.dragging) {
+          s.globe.rotation.y += s.vel.y;
+          s.globe.rotation.x = Math.max(-0.65, Math.min(0.65, s.globe.rotation.x + s.vel.x));
+          s.vel.x *= 0.92; s.vel.y *= 0.92;
+        }
+
+        // Pulse home rings
+        s.rings.forEach(r => {
+          const sc = 1 + 0.45 * Math.sin(s.t * 1.7 + r.userData.ri * 1.3);
+          r.scale.setScalar(sc);
+          r.material.opacity = (0.32 / (r.userData.ri + 1)) * (0.55 + 0.45 * Math.sin(s.t * 1.7 + r.userData.ri * 1.3));
         });
-        if(!res.ok) throw new Error("ip-api HTTP "+res.status);
-        const data = await res.json();
-        const updates = {};
-        data.forEach(r=>{
-          if(r.status==="success") {
-            const entry = { lat:r.lat, lon:r.lon, country:r.country, countryCode:r.countryCode, city:r.city };
-            geoCacheRef.current[r.query] = entry;
-            updates[r.query] = entry;
+
+        // Animate arcs
+        s.arcs.forEach(arc => {
+          arc.t += arc.speed;
+          if (arc.t > 1.8) arc.t = 0;
+          const progress = Math.min(arc.t, 1);
+          // Rebuild line up to progress
+          const count = Math.max(2, Math.floor(70 * progress));
+          const pts = [];
+          for (let i = 0; i <= count; i++) pts.push(arc.curve.getPoint(i / 70));
+          arc.geom.setFromPoints(pts);
+          // Move particle dot
+          arc.dot.position.copy(arc.curve.getPoint(progress));
+          arc.dot.material.opacity = arc.t < 1 ? 0.95 : Math.max(0, (1.8 - arc.t) * 2.2);
+          const ps = 0.7 + 0.5 * Math.sin(s.t * 10 + arc.phase);
+          arc.dot.scale.setScalar(ps);
+          // Impact pulse at home when arc first arrives
+          if (arc.t >= 1 && !arc.pulsed) {
+            arc.pulsed = true;
+            // Spawn a brief impact ring
+            for (let ri = 0; ri < 2; ri++) {
+              const ring = new THREE.Mesh(
+                new THREE.RingGeometry(0.01, 0.025, 24),
+                new THREE.MeshBasicMaterial({ color: arc.col, transparent: true, opacity: 0.9, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false })
+              );
+              const hp = ll(HOME[0], HOME[1], GR + 0.02);
+              ring.position.copy(hp);
+              ring.lookAt(new THREE.Vector3(0,0,0));
+              ring.userData.birth = s.t; ring.userData.ri = ri; ring.userData.col = arc.col;
+              s.globe.add(ring);
+              if (!s.impactRings) s.impactRings = [];
+              s.impactRings.push(ring);
+            }
           }
+          // Fade line after particle passes destination
+          if (arc.t > 1) arc.line.material.opacity = Math.max(0, (1.8 - arc.t) * 0.45);
         });
-        if(Object.keys(updates).length) {
-          setGeoCache(prev=>{
-            const next = {...prev,...updates};
-            try { sessionStorage.setItem("sv_geocache", JSON.stringify(next)); } catch {}
-            return next;
+
+        // Animate & prune impact rings
+        if (s.impactRings) {
+          s.impactRings = s.impactRings.filter(ring => {
+            const age = s.t - ring.userData.birth;
+            const maxAge = 1.8 + ring.userData.ri * 0.6;
+            if (age > maxAge) { s.globe.remove(ring); ring.material.dispose(); ring.geometry.dispose(); return false; }
+            const sc = 1 + age * 4.5;
+            ring.scale.setScalar(sc);
+            ring.material.opacity = Math.max(0, 0.7 * (1 - age / maxAge));
+            return true;
           });
         }
-        batch.forEach(ip=>pendingGeoRef.current.delete(ip));
-      }
-    } catch(e) {
-      console.warn("[GeoIP] ip-api.com lookup failed:", e.message);
-      unknown.forEach(ip=>pendingGeoRef.current.delete(ip));
-    }
-  }
 
-  // Sync geoCacheRef whenever geoCache state updates (for synchronous reads inside effects)
-  useEffect(()=>{ geoCacheRef.current = {...geoCacheRef.current, ...geoCache}; },[geoCache]);
-
-  // Returns [lat, lon] for an IP — from backend GeoIP, real ip-api cache, or null
-  function coordForAlert(alert) {
-    if(!alert) return null;
-    // 1. Use backend-resolved country coord if we have it
-    if(alert.country && COUNTRY_COORDS[alert.country]) return COUNTRY_COORDS[alert.country];
-    // 2. Use ip-api resolved exact coordinates
-    const cached = geoCacheRef.current[alert.src_ip];
-    if(cached) return [cached.lat, cached.lon];
-    return null;
-  }
-
-  // Kick off geo lookups for all external IPs in current alerts
-  useEffect(()=>{
-    const externalIps = [...new Set(alerts.filter(a=>!isPrivateIp(a.src_ip)).map(a=>a.src_ip).filter(Boolean))];
-    if(externalIps.length) resolveGeoIps(externalIps);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[alerts.length]);
-
-  // Init Leaflet map
-  useEffect(()=>{
-    ensureLeaflet(()=>{
-      if(!mapRef.current || leafRef.current) return;
-      const L = window.L;
-
-      const map = L.map(mapRef.current, {
-        center: [20, 10], zoom: 2, zoomControl: true,
-        attributionControl: false, scrollWheelZoom: true,
-      });
-
-      // v0.1: CartoDB Voyager (light) tiles
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",{
-        subdomains:"abcd", maxZoom:19
-      }).addTo(map);
-
-      // SVG overlay for animated threat lines
-      const svgNS = "http://www.w3.org/2000/svg";
-      const svg   = document.createElementNS(svgNS,"svg");
-      svg.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:500;overflow:visible";
-      mapRef.current.querySelector(".leaflet-map-pane").appendChild(svg);
-      svgLayerRef.current = svg;
-
-      // Home marker — darker green for light map
-      const homeIcon = L.divIcon({
-        className:"",
-        html:`<div style="width:16px;height:16px;border-radius:50%;background:#16a34a;border:2.5px solid #fff;box-shadow:0 0 14px rgba(22,163,74,0.7),0 0 5px rgba(22,163,74,0.5);animation:svPulse 1.5s ease infinite"></div>`,
-        iconSize:[16,16], iconAnchor:[8,8]
-      });
-      L.marker(HOME_COORD, {icon:homeIcon}).addTo(map)
-        .bindPopup("<b style='color:#16a34a'>🏠 Your Server</b><br>Luxembourg");
-
-      leafRef.current = map;
-      setMapReady(true);
-
-      // Animate lines
-      const animateLines = ()=>{
-        frameRef.current++;
-        const svgEl = svgLayerRef.current;
-        if(!svgEl || !leafRef.current) { animRef.current=requestAnimationFrame(animateLines); return; }
-        // Remove faded lines
-        linesRef.current = linesRef.current.filter(l=>{
-          if(l.alpha <= 0.02) { l.el?.remove(); l.dot?.remove(); return false; }
-          return true;
-        });
-        linesRef.current.forEach(l=>{
-          l.progress = Math.min(1, l.progress + l.speed);
-          if(l.progress>=1) l.alpha *= 0.94;
-          // v0.1: spawn impact pulse when line first reaches home
-          if(l.progress >= 1 && !l.pulsed) {
-            l.pulsed = true;
-            spawnPulse(l.color);
-          }
-          // Recompute pixel coords every frame (map may have moved/zoomed)
-          const map = leafRef.current;
-          const p1  = map.latLngToContainerPoint(l.from);
-          const p2  = map.latLngToContainerPoint(l.to);
-          const cpx = (p1.x+p2.x)/2;
-          const cpy = Math.min(p1.y,p2.y) - Math.abs(p2.x-p1.x)*0.25;
-          // Build bezier up to progress
-          let d="";
-          const steps=40;
-          for(let i=0;i<=steps*l.progress;i++){
-            const t=i/steps;
-            const bx=(1-t)*(1-t)*p1.x+2*(1-t)*t*cpx+t*t*p2.x;
-            const by=(1-t)*(1-t)*p1.y+2*(1-t)*t*cpy+t*t*p2.y;
-            d+=i===0?`M${bx},${by}`:`L${bx},${by}`;
-          }
-          if(!l.el){ const path=document.createElementNS("http://www.w3.org/2000/svg","path"); path.setAttribute("fill","none"); svgEl.appendChild(path); l.el=path; }
-          if(!l.dot){ const c=document.createElementNS("http://www.w3.org/2000/svg","circle"); c.setAttribute("r","3"); svgEl.appendChild(c); l.dot=c; }
-          l.el.setAttribute("d",d||"M0,0");
-          l.el.setAttribute("stroke",l.color);
-          l.el.setAttribute("stroke-width","1.8");
-          l.el.setAttribute("stroke-opacity",String(l.alpha));
-          // Moving dot position
-          const tp=l.progress;
-          const dx=(1-tp)*(1-tp)*p1.x+2*(1-tp)*tp*cpx+tp*tp*p2.x;
-          const dy=(1-tp)*(1-tp)*p1.y+2*(1-tp)*tp*cpy+tp*tp*p2.y;
-          l.dot.setAttribute("cx",String(dx));
-          l.dot.setAttribute("cy",String(dy));
-          l.dot.setAttribute("fill",l.color);
-          l.dot.setAttribute("opacity",String(l.alpha));
-        });
-        // v0.1: Animate impact pulses at home
-        const homeP2 = leafRef.current.latLngToContainerPoint(HOME_COORD);
-        pulsesRef.current = pulsesRef.current.filter(p=>{
-          if(p.alpha <= 0.01) { p.ring1?.remove(); p.ring2?.remove(); p.flash?.remove(); return false; }
-          return true;
-        });
-        pulsesRef.current.forEach(p=>{
-          p.age++;
-          p.radius += (p.maxRadius - p.radius) * 0.08;
-          p.alpha *= 0.96;
-          if(!p.ring1){ const c=document.createElementNS("http://www.w3.org/2000/svg","circle"); c.setAttribute("fill","none"); c.setAttribute("stroke-width","2"); svgEl.appendChild(c); p.ring1=c; }
-          p.ring1.setAttribute("cx",String(homeP2.x)); p.ring1.setAttribute("cy",String(homeP2.y));
-          p.ring1.setAttribute("r",String(p.radius)); p.ring1.setAttribute("stroke",p.color); p.ring1.setAttribute("stroke-opacity",String(p.alpha*0.8));
-          if(!p.ring2){ const c=document.createElementNS("http://www.w3.org/2000/svg","circle"); c.setAttribute("fill","none"); c.setAttribute("stroke-width","1.5"); svgEl.appendChild(c); p.ring2=c; }
-          p.ring2.setAttribute("cx",String(homeP2.x)); p.ring2.setAttribute("cy",String(homeP2.y));
-          p.ring2.setAttribute("r",String(p.radius*0.6)); p.ring2.setAttribute("stroke",p.color); p.ring2.setAttribute("stroke-opacity",String(p.alpha*0.5));
-          if(!p.flash){ const c=document.createElementNS("http://www.w3.org/2000/svg","circle"); svgEl.appendChild(c); p.flash=c; }
-          const flashAlpha = p.age < 6 ? p.alpha*1.2 : p.alpha*0.5;
-          p.flash.setAttribute("cx",String(homeP2.x)); p.flash.setAttribute("cy",String(homeP2.y));
-          p.flash.setAttribute("r",String(Math.max(3, 8 - p.age*0.3)));
-          p.flash.setAttribute("fill",p.color); p.flash.setAttribute("opacity",String(Math.min(flashAlpha,1)));
-        });
-
-        animRef.current=requestAnimationFrame(animateLines);
+        s.renderer.render(s.scene, s.camera);
       };
+      animate();
 
-      // v0.1: pulse rendering is integrated into animateLines via spawnPulse
-      animateLines();
+      // ── Drag to rotate ──
+      const el = s.renderer.domElement;
+      const dn = e => {
+        s.dragging = true;
+        s.lastMouse = { x: e.clientX, y: e.clientY };
+        el.style.cursor = "grabbing";
+      };
+      const mv = e => {
+        if (!s.dragging) return;
+        const dx = e.clientX - s.lastMouse.x, dy = e.clientY - s.lastMouse.y;
+        s.globe.rotation.y += dx * 0.004;
+        s.globe.rotation.x = Math.max(-0.65, Math.min(0.65, s.globe.rotation.x + dy * 0.004));
+        s.vel = { x: dy * 0.002, y: dx * 0.002 };
+        s.lastMouse = { x: e.clientX, y: e.clientY };
+      };
+      const up = () => {
+        s.dragging = false; el.style.cursor = "grab";
+        // No auto-rotate resume — globe stays where user leaves it
+      };
+      el.addEventListener("mousedown", dn);
+      window.addEventListener("mousemove", mv);
+      window.addEventListener("mouseup", up);
+
+      // Resize
+      const onResize = () => {
+        if (!mountRef.current) return;
+        const w = mountRef.current.clientWidth;
+        s.camera.aspect = w / 520;
+        s.camera.updateProjectionMatrix();
+        s.renderer.setSize(w, 520);
+      };
+      window.addEventListener("resize", onResize);
+
+      s._cleanup = () => {
+        cancelAnimationFrame(s.frame);
+        el.removeEventListener("mousedown", dn);
+        window.removeEventListener("mousemove", mv);
+        window.removeEventListener("mouseup", up);
+        window.removeEventListener("resize", onResize);
+        if (mountRef.current?.contains(el)) mountRef.current.removeChild(el);
+        s.renderer.dispose();
+        s.ready = false;
+      };
     });
-    return ()=>{ cancelAnimationFrame(animRef.current); leafRef.current?.remove(); leafRef.current=null; };
-  },[]);
+    return () => S.current._cleanup?.();
+  }, []);
 
-  // Plot markers + seed lines for ALL external alerts whenever alerts load, map becomes ready,
-  // or geoCache gains new entries (IPs resolved after initial render).
-  const seededIdsRef = useRef(new Set());
-  useEffect(()=>{
-    if(!mapReady || !leafRef.current || !window.L) return;
-    const L = window.L;
-    let newLinesSpawned = 0;
-    alerts.slice(0, 200).forEach(a=>{
-      if(isPrivateIp(a.src_ip)) return;
-      const coord = coordForAlert(a);
-      if(!coord) return;   // not resolved yet — will re-run when geoCache updates
-      // Add / update marker — use src_ip as key for precision (not country, multiple IPs per country)
-      const mk = `ip_${a.src_ip}`;
-      if(!markersRef.current[mk]) {
-        const sev = SEV[a.severity]||SEV.info;
-        const cached = geoCacheRef.current[a.src_ip];
-        const label = cached ? `${cached.city ? cached.city+", " : ""}${cached.country||a.country||a.src_ip}` : (a.country||a.src_ip);
-        const icon = L.divIcon({
-          className:"",
-          html:`<div style="width:10px;height:10px;border-radius:50%;background:${sev.color};border:1.5px solid rgba(0,0,0,0.3);box-shadow:0 0 8px ${sev.color}80"></div>`,
-          iconSize:[10,10], iconAnchor:[5,5]
-        });
-        markersRef.current[mk] = L.marker(coord,{icon}).addTo(leafRef.current)
-          .bindPopup(`<b style="color:${sev.color}">${FLAG[a.country]||"🌐"} ${label}</b><br><span style="color:#8e8e93">${a.src_ip}</span>`);
+  // ── Resolve GeoIPs ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const ips = [...new Set(alerts.filter(a => !_isPrivate3d(a.src_ip)).map(a => a.src_ip).filter(Boolean))];
+    const unknown = ips.filter(ip => !_geo3d[ip]);
+    if (unknown.length) _resolveGeo3d(unknown, backendUrl).then(ok => { if (ok) setGeoV(v => v + 1); });
+  }, [alerts.length]);
+
+  // ── Add arcs for new alerts ───────────────────────────────────────────────────
+  useEffect(() => {
+    const s = S.current;
+    if (!s.ready || !s.globe || !window.THREE) return;
+    const THREE = window.THREE;
+    const SEV_HEX = { critical: 0xff2d55, high: 0xff9f0a, medium: 0xffd60a, low: 0x30d158, info: 0x0a84ff };
+
+    alerts.filter(a => !_isPrivate3d(a.src_ip) && a.src_ip !== "0.0.0.0").slice(0, 80).forEach((alert, idx) => {
+      const arcId = alert.id != null ? alert.id : idx;
+      if (s.arcs.find(a => a.id === arcId)) return;
+
+      // Priority: 1) ip-api exact coords  2) country centroid  3) skip
+      const geo = _geo3d[alert.src_ip];
+      const ccCoord = COUNTRY_COORDS[alert.country] || COUNTRY_COORDS[_geo3d[alert.src_ip]?.cc];
+      const src = geo ? [geo.lat, geo.lon] : ccCoord;
+      if (!src) return;  // no coords yet — will appear after geo resolves
+
+      const from = ll(src[0], src[1], GR + 0.01);
+      const to   = ll(HOME[0], HOME[1], GR + 0.01);
+      const mid  = new THREE.Vector3().addVectors(from, to).normalize()
+        .multiplyScalar(GR * (1.3 + Math.random() * 0.6));
+      const curve = new THREE.QuadraticBezierCurve3(from, mid, to);
+      const col = SEV_HEX[alert.severity] || SEV_HEX.info;
+
+      // Arc line
+      const geom = new THREE.BufferGeometry();
+      const line = new THREE.Line(geom, new THREE.LineBasicMaterial({
+        color: col, transparent: true, opacity: 0.55,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      s.globe.add(line);
+
+      // Moving particle
+      const dot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.03, 8, 8),
+        new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false })
+      );
+      dot.position.copy(from);
+      s.globe.add(dot);
+
+      // Origin dot marker
+      if (!s.markers[alert.src_ip]) {
+        const mk = new THREE.Mesh(
+          new THREE.SphereGeometry(0.024, 8, 8),
+          new THREE.MeshBasicMaterial({ color: col, blending: THREE.AdditiveBlending })
+        );
+        mk.position.copy(ll(src[0], src[1], GR + 0.016));
+        s.globe.add(mk);
+        s.markers[alert.src_ip] = mk;
       }
-      // Seed animated lines for alerts not yet seeded
-      if(!seededIdsRef.current.has(a.id) && newLinesSpawned < 15) {
-        seededIdsRef.current.add(a.id);
-        newLinesSpawned++;
-        spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 0.4+Math.random()*0.6);
+
+      // Impact ring burst at home when arc arrives (spawned lazily in animate loop)
+      s.arcs.push({ id: arcId, curve, geom, line, dot, t: Math.random() * 0.25, speed: 0.003 + Math.random() * 0.005, phase: Math.random() * Math.PI * 2, col, pulsed: false });
+
+      // Prune oldest arcs
+      if (s.arcs.length > 70) {
+        const old = s.arcs.shift();
+        s.globe.remove(old.line); s.globe.remove(old.dot);
+        old.geom.dispose(); old.line.material.dispose(); old.dot.material.dispose();
       }
     });
-  },[mapReady, alerts.length, geoCache]);
+  }, [alerts.length, geoV]);
 
-  // Spawn a fresh line for the very latest alert as it arrives
-  useEffect(()=>{
-    const a = alerts[0];
-    if(!a || !leafRef.current || isPrivateIp(a.src_ip)) return;
-    const coord = coordForAlert(a);
-    if(!coord) return;
-    spawnLine(coord, SEV[a.severity]?.color||"#0a84ff", 1);
-  },[alerts.length]);
+  // ── Derived stats for sidebar ─────────────────────────────────────────────────
+  const topAtk = Object.entries(
+    alerts.slice(0, 500).reduce((acc, x) => {
+      if (_isPrivate3d(x.src_ip)) return acc;
+      // Prefer backend country → ip-api geo cache → raw IP as fallback (never "??")
+      const geoEntry = _geo3d[x.src_ip];
+      const cc  = x.country || geoEntry?.cc  || "";
+      const label = x.country || geoEntry?.country || x.src_ip || "Unknown";
+      const k   = cc || `ip:${x.src_ip}`;
+      if (!acc[k]) acc[k] = { country: cc, label, src_ip: x.src_ip || "", hits: 0, sev: x.severity, city: geoEntry?.city || "" };
+      acc[k].hits++; acc[k].sev = x.severity;
+      if (!acc[k].country && cc) { acc[k].country = cc; acc[k].label = label; }
+      return acc;
+    }, {})
+  ).map(([, v]) => v).sort((a, b) => b.hits - a.hits).slice(0, 8);
 
-  function spawnLine(fromCoord, color, alpha=1) {
-    linesRef.current.push({
-      from:fromCoord, to:HOME_COORD,
-      progress:0, speed:0.006+Math.random()*0.01,
-      color, alpha, el:null, dot:null, pulsed:false
-    });
-    if(linesRef.current.length>50) {
-      const old = linesRef.current.shift();
-      old.el?.remove(); old.dot?.remove();
-    }
-  }
-
-  // v0.1: spawn impact pulse at home location
-  function spawnPulse(color) {
-    pulsesRef.current.push({
-      color, radius:4, maxRadius:28+Math.random()*14,
-      alpha:0.9, age:0, ring1:null, ring2:null, flash:null
-    });
-    if(pulsesRef.current.length > 12) {
-      const old = pulsesRef.current.shift();
-      old.ring1?.remove(); old.ring2?.remove(); old.flash?.remove();
-    }
-  }
-
-  const maxHits = Math.max(...topAttackers.map(a=>a.hits),1);
+  const SC = { critical: "#ff2d55", high: "#ff9f0a", medium: "#ffd60a", low: "#30d158", info: "#0a84ff" };
+  const totalHits = topAtk.reduce((s, a) => s + a.hits, 0);
 
   return (
-    <div className="rounded-xl border border-gray-800 bg-gray-950 p-4">
-      <style>{`
-        @keyframes svPulse{0%,100%{box-shadow:0 0 14px rgba(22,163,74,0.7),0 0 5px rgba(22,163,74,0.5)}50%{box-shadow:0 0 26px rgba(22,163,74,0.9),0 0 12px rgba(22,163,74,0.7)}}
-        .leaflet-container{background:#f2f0eb!important}
-        .leaflet-tile{filter:saturate(0.7) brightness(0.97)}
-        .leaflet-popup-content-wrapper{background:#161b22;border:1px solid #30363d;border-radius:8px;color:#e6edf3;font-size:12px;font-family:monospace}
-        .leaflet-popup-tip{background:#161b22}
-        .leaflet-control-zoom a{background:#161b22!important;color:#e6edf3!important;border-color:#30363d!important}
-        .leaflet-control-zoom a:hover{background:#21262d!important}
-      `}</style>
-      <div className="flex items-center gap-2 mb-3">
-        <Globe size={14} className="text-cyan-400"/>
-        <span className="text-sm font-bold text-white">GeoIP Live Attack Map</span>
-        <span className="text-xs text-red-400 animate-pulse ml-1">● LIVE</span>
-        <span className="ml-auto text-xs text-gray-600 font-mono">{topAttackers.reduce((s,a)=>s+a.hits,0)} attacks tracked</span>
+    <div style={{ position:"relative", borderRadius:14, overflow:"hidden", border:"1px solid #1a2535", background:"#020409" }}>
+      {/* ── Title bar ── */}
+      <div style={{ position:"absolute", top:0, left:0, right:0, zIndex:20, display:"flex", alignItems:"center", gap:8, padding:"10px 16px", background:"linear-gradient(180deg,rgba(2,4,9,0.97)0%,transparent 100%)", pointerEvents:"none" }}>
+        <Globe size={13} style={{ color:"#4a9eff" }}/>
+        <span style={{ fontSize:12, fontWeight:800, letterSpacing:"0.15em", color:"white", fontFamily:"monospace" }}>CYBERTHREAT</span>
+        <span style={{ fontSize:12, fontWeight:300, letterSpacing:"0.1em", color:"#4a9eff", fontFamily:"monospace" }}>LIVE MAP</span>
+        <span style={{ fontSize:10, color:"#ff2d55", marginLeft:4 }} className="animate-pulse">⬤ LIVE</span>
+        <span style={{ marginLeft:"auto", fontSize:10, color:"#4a5568", fontFamily:"monospace" }}>{totalHits.toLocaleString()} attacks tracked</span>
       </div>
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Leaflet map */}
-        <div className="lg:col-span-2 rounded-lg overflow-hidden relative" style={{height:280,border:"1px solid #1a2a38"}}>
-          <div ref={mapRef} style={{width:"100%",height:"100%"}}/>
-          <div className="absolute bottom-2 left-10 z-50 flex items-center gap-3 text-xs font-mono pointer-events-none" style={{zIndex:1000}}>
-            <span className="flex items-center gap-1 bg-gray-950/80 px-2 py-1 rounded">
-              <span style={{width:8,height:8,borderRadius:"50%",background:"#16a34a",display:"inline-block"}}/>
-              <span className="text-gray-400">Home</span>
-            </span>
-            <span className="flex items-center gap-1 bg-gray-950/80 px-2 py-1 rounded">
-              <span style={{width:8,height:8,borderRadius:"50%",background:"#ff2d55",display:"inline-block"}}/>
-              <span className="text-gray-400">Attacker</span>
-            </span>
-            <span className="flex items-center gap-1 bg-gray-950/80 px-2 py-1 rounded">
-              <span style={{width:10,height:10,borderRadius:"50%",border:"2px solid #ff2d55",display:"inline-block",opacity:0.6}}/>
-              <span className="text-gray-400">Impact</span>
-            </span>
-          </div>
+
+      {/* ── 3D Canvas ── */}
+      <div ref={mountRef} style={{ width:"100%", height:520, cursor:"grab" }}/>
+
+      {/* ── Legend ── */}
+      <div style={{ position:"absolute", bottom:14, left:14, zIndex:20, display:"flex", gap:10, background:"rgba(2,4,9,0.82)", padding:"6px 12px", borderRadius:8, border:"1px solid #1a2535", pointerEvents:"none" }}>
+        {[["#30d158","Home (LU)"],["#ff2d55","Critical"],["#ff9f0a","High"],["#ffd60a","Medium"],["#0a84ff","Low"]].map(([c,l])=>(
+          <span key={l} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:"#8e8e93", fontFamily:"monospace" }}>
+            <span style={{ width:7, height:7, borderRadius:"50%", background:c, display:"inline-block", boxShadow:`0 0 6px ${c}` }}/>
+            {l}
+          </span>
+        ))}
+      </div>
+
+      {/* ── Top Attack Origins sidebar ── */}
+      <div style={{ position:"absolute", top:44, right:12, zIndex:20, width:188, background:"rgba(2,4,9,0.88)", borderRadius:10, border:"1px solid #1a2535", padding:"10px 12px" }}>
+        <div style={{ fontSize:9, fontWeight:700, color:"#4a5568", letterSpacing:"0.13em", marginBottom:10, fontFamily:"monospace", display:"flex", alignItems:"center", gap:4 }}>
+          <TrendingUp size={9}/> TOP ATTACK ORIGINS
         </div>
-        {/* Leaderboard */}
-        <div className="space-y-2">
-          <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
-            <TrendingUp size={11}/> Top Attack Origins
-          </div>
-          {topAttackers.map(a=>{
-            const sev = SEV[a.lastSev]||SEV.info;
-            const label = a.country && a.country !== "??" ? a.country : (a.src_ip || "Unknown");
-            return (
-              <div key={a.country||a.src_ip}>
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-sm">{FLAG[a.country]||"🌐"}</span>
-                  <span className="text-xs font-bold text-white font-mono flex-1">{label}</span>
-                  <span style={{color:sev.color}} className="text-xs font-mono font-bold">{a.hits}</span>
-                  <span className="text-xs text-gray-600 font-mono">{Math.round(a.blocked/Math.max(a.hits,1)*100)}%🛡</span>
-                </div>
-                <div className="h-1.5 rounded-full bg-gray-800 overflow-hidden">
-                  <div style={{width:`${(a.hits/maxHits)*100}%`,background:`linear-gradient(90deg,${sev.color},${sev.color}88)`,transition:"width 1s ease"}} className="h-full rounded-full"/>
-                </div>
+        {topAtk.map((a, i) => {
+          const col = SC[a.sev] || SC.info;
+          return (
+            <div key={a.src_ip || a.country} style={{ marginBottom:8 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:2 }}>
+                <span style={{ fontSize:9, color:"#4a5568", fontFamily:"monospace", width:12, textAlign:"right", flexShrink:0 }}>{i + 1}</span>
+                <span style={{ fontSize:10, color:"white", fontFamily:"monospace", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  {FLAG[a.country] || "🌐"} {a.label || a.src_ip || "Unknown"}{a.city ? `, ${a.city}` : ""}
+                </span>
+                <span style={{ fontSize:10, fontWeight:700, color:col, fontFamily:"monospace" }}>{a.hits}</span>
               </div>
-            );
-          })}
-          {topAttackers.length===0 && <div className="text-xs text-gray-600 py-4 text-center">No attacks yet…</div>}
-        </div>
+              <div style={{ height:2, background:"#0d1117", borderRadius:1, marginLeft:17, overflow:"hidden" }}>
+                <div style={{ height:"100%", background:`linear-gradient(90deg,${col}cc,${col}33)`, width:`${(a.hits / (topAtk[0]?.hits || 1)) * 100}%`, transition:"width 1s ease", borderRadius:1 }}/>
+              </div>
+            </div>
+          );
+        })}
+        {topAtk.length === 0 && (
+          <div style={{ fontSize:9, color:"#2d3748", fontFamily:"monospace", textAlign:"center", padding:"10px 0" }}>No external attacks yet…</div>
+        )}
+      </div>
+
+      {/* ── Drag hint ── */}
+      <div style={{ position:"absolute", bottom:14, right:14, zIndex:20, fontSize:9, color:"#2d3748", fontFamily:"monospace", pointerEvents:"none" }}>
+        drag to rotate
       </div>
     </div>
   );
 }
+
 
 // ─── v0.1: Connection Dependency Indicator ──────────────────────────────────
 function DependencyChain({ sshStatus, backendStatus, dbStatus, snortStatus, routerStatus, router }) {
@@ -1422,7 +1541,7 @@ function ServiceControlPanel({ backendUrl, apiKey, status }) {
   );
 }
 
-function Dashboard({ alerts, traffic, stats }) {
+function Dashboard({ alerts, traffic, stats, backendUrl }) {
   const catData = Object.entries(alerts.slice(0,300).reduce((a,x)=>{a[x.category]=(a[x.category]||0)+1;return a;},{}))
     .map(([name,value])=>({name,value,fill:CATC[name]||"#0a84ff"})).sort((a,b)=>b.value-a.value).slice(0,7);
   const sevData = ["critical","high","medium","low"].map(s=>({ name:s.toUpperCase(), value:alerts.filter(a=>a.severity===s).length, color:SEV[s].color }));
@@ -1519,7 +1638,7 @@ function Dashboard({ alerts, traffic, stats }) {
         </div>
       </div>
       {/* GeoIP Map */}
-      <GeoMap alerts={alerts}/>
+      <GeoMap alerts={alerts} backendUrl={backendUrl}/>
     </div>
   );
 }
@@ -1693,8 +1812,8 @@ function IpBlocklist({ blocklist, setBlocklist, autoBlock, setAutoBlock, backend
           ))}
         </div>
         <div className="mt-3 pt-3 border-t border-gray-800 flex gap-4 text-xs text-gray-500 flex-wrap">
-          <span>Auto-blocked: <span className="text-orange-400 font-bold font-mono">{autoBlocked}</span></span>
-          <span>Active blocks: <span className="text-red-400 font-bold font-mono">{blocklist.filter(x=>x.active).length}</span></span>
+          <span>Auto-detected: <span className="text-orange-400 font-bold font-mono">{autoBlocked}</span></span>
+          <span>Tracked IPs: <span className="text-red-400 font-bold font-mono">{blocklist.filter(x=>x.active).length}</span></span>
           <span>Target: <span className="text-cyan-300 font-mono">{router?.ip ? `Main Router ${router.ip}` : "Sensor runtime"}</span></span>
           <span className="ml-auto text-gray-600">Rule: &gt;{autoBlock.threshold} alerts in {autoBlock.window}s → block for {autoBlock.blockDuration}min</span>
         </div>
@@ -1719,7 +1838,7 @@ function IpBlocklist({ blocklist, setBlocklist, autoBlock, setAutoBlock, backend
       <div className="rounded-xl border border-gray-800 bg-gray-950 overflow-hidden">
         <div className="p-3 border-b border-gray-800 flex items-center gap-2">
           <Ban size={13} className="text-red-400"/>
-          <span className="text-sm font-bold text-white">IP Discovered </span>
+          <span className="text-sm font-bold text-white">Discovered IPs</span>
           <span className="text-xs text-gray-600 ml-1">({filtered.length})</span>
           <div className="ml-auto relative">
             <Search size={12} className="absolute left-2 top-1.5 text-gray-600"/>
@@ -3268,7 +3387,7 @@ const isDdos = !!backendStats?.ddos_detected || (ddosMode && backendStatus !== "
           <span className="text-sm font-bold text-gray-300">{NAV.find(n=>n.id===page)?.label}</span>
         </div>
 
-        {page==="dashboard"  && <Dashboard     alerts={alerts} traffic={traffic} stats={stats}/>}
+        {page==="dashboard"  && <Dashboard     alerts={alerts} traffic={traffic} stats={stats} backendUrl={backendUrl}/>}
         {page==="alerts"     && <Alerts         alerts={alerts} newIds={newIds} onBlockIp={onBlockIp}/>}
         {page==="blocklist"  && <IpBlocklist    blocklist={blocklist} setBlocklist={setBlocklist} autoBlock={autoBlock} setAutoBlock={setAutoBlock} backendUrl={backendUrl} apiKey={apiKey} backendStatus={backendStatus} onBlockIp={onBlockIp} router={router}/>}
         {page==="ddos"       && <DdosMitigation alerts={alerts} traffic={traffic} ddosMode={ddosMode} setDdosMode={setDdosMode} blocklist={blocklist} setBlocklist={setBlocklist} backendStats={backendStats} backendStatus={backendStatus}/>}

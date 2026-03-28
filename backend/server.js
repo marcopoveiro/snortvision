@@ -254,11 +254,14 @@ if (GEOIP_EN) {
 }
 
 function geoLookup(ip) {
-  if (!geoip) return { country: "", city: "" };
+  if (!geoip) return { country: "", city: "", lat: null, lon: null };
   try {
     const g = geoip.lookup(ip);
-    return g ? { country: g.country || "", city: g.city || "" } : { country: "", city: "" };
-  } catch { return { country: "", city: "" }; }
+    return g ? {
+      country: g.country || "", city: g.city || "",
+      lat: g.ll?.[0] ?? null, lon: g.ll?.[1] ?? null,
+    } : { country: "", city: "", lat: null, lon: null };
+  } catch { return { country: "", city: "", lat: null, lon: null }; }
 }
 
 // ─── SQLite Database ────────────────────────────────────────────────────────
@@ -2488,6 +2491,59 @@ app.delete("/api/alerts", auth, (req, res) => {
 });
 
 // Public — no auth — lets the frontend recover backendUrl after localStorage clear
+// ─── GeoIP proxy — browser calls this instead of ip-api.com directly ────────────
+// This avoids HTTPS mixed-content blocks when the frontend is served over HTTPS.
+// Falls back to geoip-lite if installed, then ip-api.com server-side.
+const geoProxyCache = {};
+
+app.post("/api/public/geoip", async (req, res) => {
+  const ips = (req.body?.ips || []).filter(ip => ip && typeof ip === "string").slice(0, 100);
+  if (!ips.length) return res.json({ results: [] });
+
+  const results = [];
+  const needRemote = [];
+
+  for (const ip of ips) {
+    if (geoProxyCache[ip]) { results.push(geoProxyCache[ip]); continue; }
+    // Try geoip-lite first (instant, offline)
+    const local = geoLookup(ip);
+    if (local.country && local.lat && local.lon) {
+      const entry = { ip, lat: local.lat, lon: local.lon, country: local.country, city: local.city || "", cc: local.country };
+      geoProxyCache[ip] = entry; results.push(entry);
+    } else {
+      needRemote.push(ip);
+    }
+  }
+
+  if (needRemote.length) {
+    try {
+      const r = await fetch("http://ip-api.com/batch?fields=status,query,lat,lon,country,countryCode,city", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(needRemote.map(q => ({ query: q }))),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        data.forEach(d => {
+          if (d.status === "success") {
+            const entry = { ip: d.query, lat: d.lat, lon: d.lon, country: d.country, city: d.city || "", cc: d.countryCode };
+            geoProxyCache[d.query] = entry;
+            results.push(entry);
+          } else {
+            results.push({ ip: d.query, lat: null, lon: null, country: "", city: "", cc: "" });
+          }
+        });
+      }
+    } catch(e) {
+      console.warn("[GeoIP proxy] ip-api.com failed:", e.message);
+      needRemote.forEach(ip => results.push({ ip, lat: null, lon: null, country: "", city: "", cc: "" }));
+    }
+  }
+
+  res.json({ results });
+});
+
 app.get("/api/public/client-config", (req, res) => {
   res.json({
     backendUrl:   process.env.BACKEND_URL || "",
