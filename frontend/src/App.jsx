@@ -977,6 +977,129 @@ function DatabasePanel({ backendUrl, apiKey, backendStatus, dbStatus, setDbStatu
   );
 }
 
+// ─── DB Management Panel ──────────────────────────────────────────────────────
+function DbManagePanel({ backendUrl, apiKey }) {
+  const [stats, setStats]   = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [confirmDays, setConfirmDays] = useState("");
+  const [showConfirmAll, setShowConfirmAll] = useState(false);
+
+  const headers = apiKey ? { "X-API-Key": apiKey } : {};
+
+  const fetchStats = async () => {
+    if(!backendUrl || !apiKey) return;
+    setLoading(true);
+    try {
+      const r = await fetch(`${backendUrl}/api/db/stats`, { headers });
+      const d = await r.json();
+      setStats(d);
+    } catch(e) { setResult({ ok:false, msg: e.message }); }
+    setLoading(false);
+  };
+
+  useEffect(()=>{ fetchStats(); }, [backendUrl, apiKey]);
+
+  const purge = async (days) => {
+    setLoading(true); setResult(null);
+    try {
+      const url = days ? `${backendUrl}/api/alerts?days=${days}` : `${backendUrl}/api/alerts`;
+      const r = await fetch(url, { method:"DELETE", headers });
+      const d = await r.json();
+      setResult({ ok:d.ok, msg: `Deleted ${d.deleted?.toLocaleString()} alerts — ${d.remaining?.toLocaleString()} remaining` });
+      await fetchStats();
+    } catch(e) { setResult({ ok:false, msg:e.message }); }
+    setLoading(false); setShowConfirmAll(false);
+  };
+
+  const fmt = (bytes) => {
+    if(!bytes) return "0 B";
+    const units = ["B","KB","MB","GB"];
+    let i = 0, v = bytes;
+    while(v >= 1024 && i < units.length-1) { v /= 1024; i++; }
+    return `${v.toFixed(i===0?0:1)} ${units[i]}`;
+  };
+
+  return (
+    <div className="rounded-xl border border-gray-800 bg-gray-950 p-4 space-y-4">
+      <div className="flex items-center gap-2">
+        <Database size={14} className="text-orange-400"/>
+        <span className="text-sm font-bold text-white">DB Storage & Cleanup</span>
+        <button onClick={fetchStats} disabled={loading} className="ml-auto text-xs text-gray-500 hover:text-gray-300 font-mono flex items-center gap-1">
+          <RefreshCw size={11} className={loading?"animate-spin":""}/>Refresh
+        </button>
+      </div>
+
+      {stats && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          {[
+            { label:"Total Alerts",   val: stats.count?.toLocaleString(),          color:"#ff2d55" },
+            { label:"DB Size",        val: fmt(stats.dbSizeBytes),                  color:"#ff9f0a" },
+            { label:"Max Retention",  val: stats.maxAlerts?.toLocaleString(),        color:"#0a84ff" },
+            { label:"Fill %",         val: `${Math.round((stats.count/Math.max(stats.maxAlerts,1))*100)}%`, color:"#30d158" },
+          ].map(s=>(
+            <div key={s.label} style={{borderColor:`${s.color}20`,background:`${s.color}06`}} className="rounded-lg border p-2.5 text-center">
+              <div style={{color:s.color}} className="text-lg font-black font-mono">{s.val}</div>
+              <div className="text-xs text-gray-500 mt-0.5">{s.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {stats && (
+        <div className="text-xs text-gray-500 font-mono bg-black/30 rounded-lg px-3 py-2 space-y-0.5">
+          <div>Oldest alert: <span className="text-gray-300">{stats.oldest ? new Date(stats.oldest).toLocaleString() : "—"}</span></div>
+          <div>Newest alert: <span className="text-gray-300">{stats.newest ? new Date(stats.newest).toLocaleString() : "—"}</span></div>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        <div className="text-xs font-bold text-gray-400 uppercase tracking-wider">Purge Alerts</div>
+        <div className="flex gap-2 flex-wrap">
+          {[7, 14, 30, 60, 90].map(d=>(
+            <button key={d} onClick={()=>{ setConfirmDays(String(d)); setShowConfirmAll(false); }}
+              disabled={loading}
+              className="px-3 py-1.5 rounded-lg text-xs font-bold font-mono border border-gray-700 text-gray-400 hover:border-orange-700 hover:text-orange-400 transition-all disabled:opacity-40">
+              &gt; {d} days old
+            </button>
+          ))}
+          <button onClick={()=>{ setShowConfirmAll(true); setConfirmDays(""); }}
+            disabled={loading}
+            className="px-3 py-1.5 rounded-lg text-xs font-bold font-mono border border-red-900/50 text-red-500 hover:border-red-500 transition-all disabled:opacity-40">
+            🗑 ALL alerts
+          </button>
+        </div>
+
+        {confirmDays && (
+          <div className="rounded-lg border border-orange-900/40 bg-orange-900/10 p-3 flex items-center gap-3">
+            <AlertTriangle size={14} className="text-orange-400 flex-shrink-0"/>
+            <span className="text-xs text-orange-300 flex-1">Delete alerts older than <b>{confirmDays} days</b>?</span>
+            <button onClick={()=>purge(confirmDays)} disabled={loading}
+              className="px-3 py-1.5 rounded-lg bg-orange-700 hover:bg-orange-600 text-white text-xs font-bold">Confirm</button>
+            <button onClick={()=>setConfirmDays("")} className="text-gray-500 hover:text-gray-300 text-xs">Cancel</button>
+          </div>
+        )}
+        {showConfirmAll && (
+          <div className="rounded-lg border border-red-900/40 bg-red-900/10 p-3 flex items-center gap-3">
+            <AlertTriangle size={14} className="text-red-400 flex-shrink-0"/>
+            <span className="text-xs text-red-300 flex-1"><b>Delete ALL alerts?</b> This cannot be undone.</span>
+            <button onClick={()=>purge(null)} disabled={loading}
+              className="px-3 py-1.5 rounded-lg bg-red-700 hover:bg-red-600 text-white text-xs font-bold">Delete All</button>
+            <button onClick={()=>setShowConfirmAll(false)} className="text-gray-500 hover:text-gray-300 text-xs">Cancel</button>
+          </div>
+        )}
+      </div>
+
+      {result && (
+        <div className={`flex items-center gap-2 text-xs font-mono px-3 py-2 rounded-lg border ${
+          result.ok?"text-green-400 bg-green-900/10 border-green-900/40":"text-red-400 bg-red-900/10 border-red-900/40"}`}>
+          {result.ok ? "✓" : "✗"} {result.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── v0.1: Sync & Operations Panel ────────────────────────────────────────────
 function SyncPanel({ backendUrl, apiKey, status, router }) {
   const [syncLog,setSyncLog]       = useState([]);
@@ -2632,6 +2755,7 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
       </div>
 
       <DatabasePanel backendUrl={backendUrl} apiKey={apiKey} backendStatus={backendStatus} dbStatus={dbStatus} setDbStatus={setDbStatus}/>
+      <DbManagePanel backendUrl={backendUrl} apiKey={apiKey}/>
       <SyncPanel backendUrl={backendUrl} apiKey={apiKey} status={backendStatus} router={router}/>
       <ServiceControlPanel backendUrl={backendUrl} apiKey={apiKey} status={backendStatus}/>
     </div>
@@ -2731,6 +2855,15 @@ export default function SnortVision() {
   useEffect(()=>{ saveSetting("apiKey",apiKey); },[apiKey]);
   useEffect(()=>{ saveSetting("theme",theme); document.documentElement.dataset.theme = theme; },[theme]);
   useEffect(()=>{ saveSetting("page",page); },[page]);
+
+  // ── Recover backendUrl from server if localStorage was cleared ──────────────
+  useEffect(()=>{
+    if(backendUrl) return; // already have it
+    fetch("/api/public/client-config")
+      .then(r=>{ if(!r.ok) throw new Error("no config"); return r.json(); })
+      .then(cfg=>{ if(cfg.backendUrl) setBackendUrl(cfg.backendUrl); })
+      .catch(()=>{}); // silently ignore — user can fill in manually
+  },[]);
 
   // keep ref in sync so polling closures always see latest values
   useEffect(()=>{ backendRef.current = {url:backendUrl, key:apiKey, status:backendStatus}; },[backendUrl,apiKey,backendStatus]);

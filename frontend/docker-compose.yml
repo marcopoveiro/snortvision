@@ -69,6 +69,10 @@ services:
       - DB_PATH=/app/data/snortvision.db
       # CORS: set to your public domain when behind a reverse proxy
       - CORS_ORIGIN=${CORS_ORIGIN:-*}
+      # Public URL used by the browser to reach the backend (used after localStorage clear)
+      - BACKEND_URL=${BACKEND_URL:-}
+      # DB retention: auto-prune when alert count exceeds this value
+      - MAX_ALERTS=${MAX_ALERTS:-500000}
     volumes:
       - ./.env:/app/.env                 # Persist API key + UI env writes on the host
       - ./keys:/app/keys:ro              # SSH private keys for sensor/router

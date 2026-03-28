@@ -352,6 +352,25 @@ const insertAlert = db.prepare(`
   VALUES (@ts,@rule,@msg,@category,@severity,@src_ip,@dst_ip,@src_port,@dst_port,@proto,@action,@country,@city,@raw)
 `);
 
+// ─── DB retention ────────────────────────────────────────────────────────────
+const MAX_ALERTS = parseInt(process.env.MAX_ALERTS || "500000", 10);
+const pruneStmt  = db.prepare("DELETE FROM alerts WHERE id IN (SELECT id FROM alerts ORDER BY id ASC LIMIT ?)");
+
+function pruneAlerts() {
+  try {
+    const count = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
+    if (count > MAX_ALERTS) {
+      const toDel = count - MAX_ALERTS;
+      pruneStmt.run(toDel);
+      console.log(`[DB] Pruned ${toDel} old alerts (retention: ${MAX_ALERTS})`);
+    }
+  } catch(e) { console.error("[DB] prune error:", e.message); }
+}
+
+// Run prune once on startup + every 6 hours
+pruneAlerts();
+setInterval(pruneAlerts, 6 * 60 * 60 * 1000);
+
 function migrateStoredAlerts() {
   const rows = db.prepare("SELECT id, ts, src_ip, country, city FROM alerts ORDER BY id DESC LIMIT 5000").all();
   const updateTs = db.prepare("UPDATE alerts SET ts=? WHERE id=?");
@@ -2015,20 +2034,23 @@ app.post("/api/config/router", auth, async (req, res) => {
     return res.json({ ok: true, message: "Router target saved without IP — management panel is disabled until an IP is set." });
   }
 
-  const info = await getRouterTelemetry(cfg);
-  if (!info.reachable) {
-    return res.json({ ok: false, message: info.error || `Router ${cfg.ip} is unreachable`, info });
+  try {
+    const info = await getRouterTelemetry(cfg);
+    if (!info.reachable)   return res.json({ ok: false, message: info.error || `Router ${cfg.ip} is unreachable`, info });
+    if (!info.sshConnected) return res.json({ ok: false, message: info.error || `SSH login failed for ${cfg.ip}`, info });
+    return res.json({ ok: true, message: `Router ${cfg.ip} connected`, info });
+  } catch(e) {
+    return res.json({ ok: false, message: `Router connection error: ${e.message}` });
   }
-  if (!info.sshConnected) {
-    return res.json({ ok: false, message: info.error || `Router ${cfg.ip} answered on TCP but SSH login failed`, info });
-  }
-
-  return res.json({ ok: true, message: `Router ${cfg.ip} connected`, info });
 });
 
 app.get("/api/router/info", auth, async (req, res) => {
-  const info = await getRouterTelemetry(getRouterConfig());
-  res.json({ ok: info.reachable && info.sshConnected, info });
+  try {
+    const info = await getRouterTelemetry(getRouterConfig());
+    res.json({ ok: info.reachable && info.sshConnected, info });
+  } catch(e) {
+    res.json({ ok: false, message: e.message, info: { error: e.message } });
+  }
 });
 
 // ── Notification config ───────────────────────────────────────────────────────
@@ -2428,7 +2450,51 @@ function handleNewAlertLine(line) {
 
   broadcast("alert", alert);
   dispatchNotifications(alert).catch(e => console.error("[Notify]", e.message));
+
+  // Non-blocking prune — runs asap after insert but doesn't block the alert pipeline
+  setImmediate(()=>{
+    const count = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
+    if (count > MAX_ALERTS) pruneAlerts();
+  });
 }
+
+// ─── DB management endpoints ─────────────────────────────────────────────────
+app.get("/api/db/stats", auth, (req, res) => {
+  const count   = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
+  const oldest  = db.prepare("SELECT ts FROM alerts ORDER BY id ASC  LIMIT 1").get();
+  const newest  = db.prepare("SELECT ts FROM alerts ORDER BY id DESC LIMIT 1").get();
+  const dbSizeBytes = (() => { try { return fs.statSync(DB_PATH).size; } catch { return 0; } })();
+  const configRows  = db.prepare("SELECT COUNT(*) as c FROM config").get().c;
+  const blocklistRows = db.prepare("SELECT COUNT(*) as c FROM blocklist").get().c;
+  res.json({ count, oldest: oldest?.ts || null, newest: newest?.ts || null, dbSizeBytes, maxAlerts: MAX_ALERTS, configRows, blocklistRows });
+});
+
+// DELETE /api/alerts?days=30  — delete older than N days
+// DELETE /api/alerts           — delete ALL alerts
+app.delete("/api/alerts", auth, (req, res) => {
+  const days = parseInt(req.query.days);
+  let deleted;
+  if (days && days > 0) {
+    const result = db.prepare(`DELETE FROM alerts WHERE ts < datetime('now','-${days} days')`).run();
+    deleted = result.changes;
+  } else {
+    const result = db.prepare("DELETE FROM alerts").run();
+    deleted = result.changes;
+  }
+  db.prepare("VACUUM").run();
+  const remaining = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
+  console.log(`[DB] Manual purge: deleted ${deleted} alerts, ${remaining} remaining`);
+  res.json({ ok: true, deleted, remaining });
+});
+
+// Public — no auth — lets the frontend recover backendUrl after localStorage clear
+app.get("/api/public/client-config", (req, res) => {
+  res.json({
+    backendUrl:   process.env.BACKEND_URL || "",
+    requiresAuth: !!(API_KEY),
+    version:      "0.1",
+  });
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 if (HAS_FRONTEND_DIST) {
