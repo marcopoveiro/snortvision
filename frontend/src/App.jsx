@@ -1645,9 +1645,12 @@ function Dashboard({ alerts, traffic, stats, backendUrl }) {
 
 // ─── ALERTS ───────────────────────────────────────────────────────────────────
 function Alerts({ alerts, newIds, onBlockIp }) {
-  const [sev,setSev] = useState("all");
-  const [q,setQ]     = useState("");
+  const [sev,setSev]                   = useState("all");
+  const [q,setQ]                       = useState("");
+  const [hideDecoder,setHideDecoder]   = useState(true);
   const filtered = alerts.filter(a=>{
+    // Hide decoder/codec alerts (0.0.0.0 src+dst, or DECODER category) by default
+    if(hideDecoder && (a.category==="DECODER" || (a.src_ip==="0.0.0.0" && a.dst_ip==="0.0.0.0"))) return false;
     if(sev!=="all"&&a.severity!==sev) return false;
     if(q&&!a.msg.toLowerCase().includes(q.toLowerCase())&&!a.src_ip.includes(q)) return false;
     return true;
@@ -1669,7 +1672,20 @@ function Alerts({ alerts, newIds, onBlockIp }) {
               }`}>{f.toUpperCase()}</button>
           ))}
         </div>
-        <span className="text-xs text-gray-500 ml-auto">{filtered.length} events</span>
+        <div className="flex items-center gap-2 ml-auto">
+          <button onClick={()=>setHideDecoder(p=>!p)}
+            title="Snort 3 codec/decoder alerts (GID 116) fire before IP parsing — they have no src/dst IP"
+            style={{
+              background: hideDecoder ? "rgba(10,132,255,0.1)" : "rgba(255,159,10,0.1)",
+              borderColor: hideDecoder ? "rgba(10,132,255,0.3)" : "rgba(255,159,10,0.4)",
+              color: hideDecoder ? "#0a84ff" : "#ff9f0a"
+            }}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-mono font-bold transition-all">
+            {hideDecoder ? <EyeOff size={11}/> : <Eye size={11}/>}
+            {hideDecoder ? "Decoder hidden" : "Decoder shown"}
+          </button>
+          <span className="text-xs text-gray-500">{filtered.length} events</span>
+        </div>
       </div>
       <div className="rounded-xl border border-gray-800 overflow-hidden">
         <div className="overflow-x-auto">
@@ -1897,13 +1913,8 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
   const ddosAlerts = alerts.filter(a=>a.category==="DDOS").sort((a,b)=>toAlertTimeMs(b.ts)-toAlertTimeMs(a.ts));
   const recentDdos = ddosAlerts.slice(0, 25);
   const ddosSources = Object.values(ddosAlerts.reduce((acc, alert) => {
-    if(!alert.src_ip || alert.src_ip === "unknown") return acc;
-    // External IPs only — internal traffic is not a DDoS source
-    const parts = alert.src_ip.split(".").map(Number);
-    const isPrivate = parts[0]===10 || parts[0]===127 ||
-      (parts[0]===172&&parts[1]>=16&&parts[1]<=31) ||
-      (parts[0]===192&&parts[1]===168) || parts[0]===0;
-    if(isPrivate) return acc;
+    // Skip decoder alerts (0.0.0.0) but keep all real IPs including internal ones
+    if(!alert.src_ip || alert.src_ip === "unknown" || alert.src_ip === "0.0.0.0") return acc;
     const key = alert.src_ip;
     if (!acc[key]) acc[key] = { ip:key, hits:0, lastTs:alert.ts, lastMsg:alert.msg, severity:alert.severity, blocked:0 };
     acc[key].hits += 1;
@@ -3234,7 +3245,15 @@ useEffect(() => {
     if(!autoBlock.enabled) return;
     const windowMs = autoBlock.window * 1000;
     const now = Date.now();
-    const recent = alerts.filter(a=>(now - new Date(a.ts).getTime()) < windowMs);
+    const recent = alerts.filter(a=>{
+      if((now - new Date(a.ts).getTime()) >= windowMs) return false;
+      if(!a.src_ip || a.src_ip === "0.0.0.0" || a.category === "DECODER") return false;
+      if(a.severity && autoBlock.minSeverity) {
+        const sevOrder = {low:0,medium:1,high:2,critical:3};
+        if((sevOrder[a.severity]||0) < (sevOrder[autoBlock.minSeverity]||0)) return false;
+      }
+      return true;
+    });
     const counts = recent.reduce((acc,a)=>{acc[a.src_ip]=(acc[a.src_ip]||0)+1;return acc;},{});
     Object.entries(counts).forEach(([ip,count])=>{
       if(count >= autoBlock.threshold && !blocklist.some(b=>b.ip===ip&&b.active)) {
