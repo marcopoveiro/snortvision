@@ -389,10 +389,13 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       }
 
       // ── Lighting ──
-      s.scene.add(new THREE.AmbientLight(0x0d1933, 3));
-      const sun = new THREE.DirectionalLight(0x4477ff, 2);
-      sun.position.set(8, 4, 6);
+      s.scene.add(new THREE.AmbientLight(0x1b2c4d, 1.6));
+      const sun = new THREE.DirectionalLight(0xdfe9ff, 1.35);   // key light: shading and relief
+      sun.position.set(-6, 5, 7);
       s.scene.add(sun);
+      const rim = new THREE.DirectionalLight(0x2f6bff, 0.9);    // cool back light outlines the limb
+      rim.position.set(6, -2, -5);
+      s.scene.add(rim);
 
       // ── Globe group ──
       s.globe = new THREE.Group();
@@ -406,27 +409,34 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       s.globe.rotation.x = s.homeView.x;
       s.scene.add(s.globe);
 
-      // Base sphere
+      // Base sphere: daytime Earth pushed into the app's night-blue palette, so land reads
+      // as land (lighter, with relief) against a deep, glossy sea; city lights glow on top.
       const gMat = new THREE.MeshPhongMaterial({
-        color: 0x060e1f, emissive: 0x020810, specular: 0x0055ff, shininess: 18,
+        color: 0x0b1a33, emissive: 0xffffff, emissiveIntensity: 0,
+        specular: 0x14305a, shininess: 35, bumpScale: 0.045,
       });
-      s.globe.add(new THREE.Mesh(new THREE.SphereGeometry(GR, 64, 64), gMat));
+      s.globe.add(new THREE.Mesh(new THREE.SphereGeometry(GR, 96, 96), gMat));
 
-      // Load Earth night texture with fallbacks
       const tl = new THREE.TextureLoader();
-      const tryTex = (urls, i = 0) => {
+      const tryTex = (name, apply, i = 0) => {
+        const urls = [
+          `https://cdn.jsdelivr.net/npm/three-globe@2.31.0/example/img/${name}`,
+          `https://unpkg.com/three-globe@2.31.0/example/img/${name}`,
+        ];
         if (i >= urls.length) return;
-        tl.load(urls[i], tex => {
-          gMat.map = tex; gMat.color.set(0xffffff); gMat.needsUpdate = true;
-        }, undefined, () => tryTex(urls, i + 1));
+        tl.load(urls[i], tex => { apply(tex); gMat.needsUpdate = true; }, undefined, () => tryTex(name, apply, i + 1));
       };
-      tryTex([
-        "https://unpkg.com/three-globe/example/img/earth-night.jpg",
-        "https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg",
-      ]);
+      // land/sea colour; tinted toward steel blue so it stays in the dashboard's palette
+      tryTex("earth-blue-marble.jpg", tex => { gMat.map = tex; gMat.color.set(0x7d9cc7); });
+      // relief: mountains catch the light, so the continents look raised
+      tryTex("earth-topology.png", tex => { gMat.bumpMap = tex; });
+      // water mask: only the sea reflects the light
+      tryTex("earth-water.png", tex => { gMat.specularMap = tex; });
+      // city lights, faint, so the populated coasts still glow on the dark side
+      tryTex("earth-night.jpg", tex => { gMat.emissiveMap = tex; gMat.emissive.set(0xffc36b); gMat.emissiveIntensity = 0.55; });
 
       // Lat/lon grid
-      const gL = new THREE.LineBasicMaterial({ color: 0x0a2550, transparent: true, opacity: 0.2 });
+      const gL = new THREE.LineBasicMaterial({ color: 0x3a6ab0, transparent: true, opacity: 0.08 });
       for (let lat = -80; lat <= 80; lat += 20) {
         const pts = []; for (let lon = -180; lon <= 181; lon += 3) pts.push(ll(lat, lon, GR + 0.003));
         s.globe.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), gL.clone()));
