@@ -3833,6 +3833,19 @@ useEffect(()=>{
     const {url,key,status} = backendRef.current;
     if(status !== "connected") return;
     try {
+      // First poll: start from the newest flows. /api/flows/new?since=0 returns the
+      // OLDEST 500, so the feed used to crawl through months of history, 500 rows
+      // every 3 s, and showed it as live traffic.
+      if(flowLastIdRef.current === 0){
+        const r0 = await fetch(`${url}/api/flows?limit=1500`, { headers: key ? {"X-API-Key":key} : {} });
+        if(!r0.ok) return;
+        const seed = (await r0.json()).data || [];
+        if(seed.length > 0){
+          flowLastIdRef.current = Math.max(...seed.map(f=>f.id));
+          setFlows(seed);          // already newest first (ORDER BY id DESC)
+        }
+        return;
+      }
       const res = await fetch(
         `${url}/api/flows/new?since=${flowLastIdRef.current}`,
         { headers: key ? {"X-API-Key":key} : {} }
