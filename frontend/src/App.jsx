@@ -284,6 +284,10 @@ function countryName(cc, fallback = "") {
   if (cc && /^[A-Z]{2}$/.test(cc)) { try { return _regionNames?.of(cc) || cc; } catch { return cc; } }
   return fallback || cc || "";
 }
+// Flag emoji from the ISO code (regional indicator letters); 🌐 when unknown.
+function flagOf(cc) {
+  return cc && /^[A-Z]{2}$/.test(cc) ? String.fromCodePoint(...[...cc].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : "🌐";
+}
 // Canvas height follows the card width (wide screens get a taller stage, phones a shorter one).
 const globeHeight = w => Math.round(Math.max(360, Math.min(560, w * 0.48)));
 const _reduceMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -296,7 +300,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     arcs:[], flowArcs:[], markers:{}, rings:[], frame:null,
     t:0, dragging:false, lastMouse:{x:0,y:0},
     vel:{x:0,y:0}, autoRot:false, autoTimer:null, ready:false,  // autoRot permanently off
-    homeView:{x:0,y:0}, tween:null,
+    homeView:{x:0,y:0}, tween:null, zoom:6.4, zoomTarget:6.4,
   });
   const [geoV, setGeoV] = useState(0);
 
@@ -318,7 +322,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
   function arcCurve(a, b) {
     const THREE = window.THREE;
     const ang = a.angleTo(b);                          // 0..PI
-    const lift = GR * (1.04 + 0.42 * (ang / Math.PI));
+    const lift = GR * (1.1 + 0.36 * (ang / Math.PI));   // short hops (UK, DE) still rise clear of the home marker
     const mid = new THREE.Vector3().addVectors(a, b);
     if (mid.lengthSq() < 1e-6) mid.set(0, 1, 0);       // antipodal guard
     return new THREE.QuadraticBezierCurve3(a, mid.normalize().multiplyScalar(lift * 1.06), b);
@@ -332,9 +336,15 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     const zAfter = Math.hypot(h.x, h.z);
     return { x: Math.atan2(h.y, zAfter) * 0.78, y };
   }
+  const ZOOM_MIN = 2.7, ZOOM_MAX = 9, ZOOM_HOME = 6.4;
+  function zoomBy(factor) {
+    const s = S.current;
+    s.zoomTarget = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, s.zoomTarget * factor));
+  }
   function recentre() {
     const s = S.current;
     if (!s.globe) return;
+    s.zoomTarget = ZOOM_HOME;
     s.vel = { x: 0, y: 0 };
     const from = { x: s.globe.rotation.x, y: s.globe.rotation.y };
     // take the short way round
@@ -447,6 +457,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       );
       homeDot.position.copy(homePos);
       s.globe.add(homeDot);
+      s.homeDot = homeDot;
 
       for (let i = 0; i < 3; i++) {
         const ring = new THREE.Mesh(
@@ -467,6 +478,11 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
 
         // Rotation
         // Auto-rotation disabled — globe only moves on drag
+        // Ease the camera toward the requested zoom
+        if (Math.abs(s.zoom - s.zoomTarget) > 0.001) {
+          s.zoom += (s.zoomTarget - s.zoom) * (_reduceMotion ? 1 : 0.15);
+          s.camera.position.z = s.zoom;
+        }
         if (s.tween) {
           const k = Math.min(1, (s.t - s.tween.t0) / s.tween.dur);
           const e = 1 - Math.pow(1 - k, 3);
@@ -479,9 +495,12 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           s.vel.x *= 0.92; s.vel.y *= 0.92;
         }
 
+        // Markers keep their on-screen size whatever the zoom
+        const zs = (s.zoom - GR) / (ZOOM_HOME - GR);
+        s.homeDot.scale.setScalar(zs);
         // Pulse home rings
         s.rings.forEach(r => {
-          const sc = 1 + 0.45 * Math.sin(s.t * 1.7 + r.userData.ri * 1.3);
+          const sc = (1 + 0.45 * Math.sin(s.t * 1.7 + r.userData.ri * 1.3)) * zs;
           r.scale.setScalar(sc);
           r.material.opacity = (0.32 / (r.userData.ri + 1)) * (0.55 + 0.45 * Math.sin(s.t * 1.7 + r.userData.ri * 1.3));
         });
@@ -533,8 +552,9 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           for (let i = 0; i <= count; i++) pts.push(arc.curve.getPoint(i / 60));
           arc.geom.setFromPoints(pts);
           arc.dot.position.copy(arc.curve.getPoint(progress));
-          arc.dot.material.opacity = arc.t < 1 ? 0.6 : Math.max(0, (1.4 - arc.t) * 1.5);
-          if (arc.t > 1) arc.line.material.opacity = Math.max(0, (1.4 - arc.t) * 0.22);
+          const w = arc.weight ?? 0.5;
+          arc.dot.material.opacity = (arc.t < 1 ? 0.35 + 0.5 * w : Math.max(0, (1.4 - arc.t) * 1.5));
+          arc.line.material.opacity = arc.t > 1 ? Math.max(0.05 + 0.1 * w, (1.4 - arc.t) * 0.5) : 0.08 + 0.3 * w;
         });
 
         // Animate & prune impact rings
@@ -565,8 +585,9 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       const mv = e => {
         if (!s.dragging) return;
         const dx = e.clientX - s.lastMouse.x, dy = e.clientY - s.lastMouse.y;
-        s.globe.rotation.y += dx * 0.004;
-        s.globe.rotation.x = Math.max(-1.2, Math.min(1.2, s.globe.rotation.x + dy * 0.004));
+        const k = 0.004 * Math.min(1, (s.zoom - GR) / (ZOOM_HOME - GR));   // finer control when zoomed in
+        s.globe.rotation.y += dx * k;
+        s.globe.rotation.x = Math.max(-1.2, Math.min(1.2, s.globe.rotation.x + dy * k));
         s.vel = { x: dy * 0.002, y: dx * 0.002 };
         s.lastMouse = { x: e.clientX, y: e.clientY };
       };
@@ -576,6 +597,9 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       };
       el.addEventListener("mousedown", dn);
       el.addEventListener("dblclick", recentre);
+      // Wheel zoom only while the pointer is over the globe; the page scrolls normally elsewhere.
+      const wh = e => { e.preventDefault(); zoomBy(Math.exp(e.deltaY * 0.0012)); };
+      el.addEventListener("wheel", wh, { passive: false });
       window.addEventListener("mousemove", mv);
       window.addEventListener("mouseup", up);
 
@@ -594,6 +618,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         cancelAnimationFrame(s.frame);
         el.removeEventListener("mousedown", dn);
         el.removeEventListener("dblclick", recentre);
+        el.removeEventListener("wheel", wh);
         window.removeEventListener("mousemove", mv);
         window.removeEventListener("mouseup", up);
         window.removeEventListener("resize", onResize);
@@ -702,22 +727,39 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     // outbound = cool blue, inbound = teal, other = violet
     const DIR_HEX = { outbound: 0x0a84ff, inbound: 0x30d1c0, external: 0xbf5af2 };
 
-    flows.filter(f => f.ext_ip && !_isPrivate3d(f.ext_ip)).slice(0, 120).forEach((flow, idx) => {
-      const arcId = flow.id != null ? flow.id : `f${idx}`;
-      if (s.flowArcs.find(a => a.id === arcId)) return;
-
+    // One arc per place and direction (not per connection), so every country in the
+    // window shows up; brightness and particle speed follow the connection count.
+    const groups = {};
+    for (const flow of flows.slice(0, 3000)) {
+      if (!flow.ext_ip || _isPrivate3d(flow.ext_ip)) continue;
       const geo = _geo3d[flow.ext_ip];
-      const ccCoord = COUNTRY_COORDS[flow.country] || COUNTRY_COORDS[geo?.cc];
-      const ext = geo ? [geo.lat, geo.lon] : ccCoord;
-      if (!ext) return;  // no coords yet — resolves later
+      const ext = geo ? [geo.lat, geo.lon] : COUNTRY_COORDS[flow.country] || COUNTRY_COORDS[geo?.cc];
+      if (!ext) continue;  // no coords yet — resolves later
+      const dir = flow.direction === "outbound" ? "outbound" : flow.direction === "inbound" ? "inbound" : "external";
+      const key = `${dir}|${ext[0].toFixed(0)},${ext[1].toFixed(0)}`;
+      (groups[key] ||= { key, dir, ext, n: 0 }).n++;
+    }
+    const wanted = Object.values(groups).sort((a, b) => b.n - a.n).slice(0, 160);
+    const keep = new Set(wanted.map(g => g.key));
 
-      // inbound traffic flows ext→home, outbound flows home→ext
-      const a = ll(ext[0], ext[1], GR + 0.01);
-      const h = ll(HOME[0], HOME[1], GR + 0.01);
-      const from = flow.direction === "outbound" ? h : a;
-      const to   = flow.direction === "outbound" ? a : h;
+    // drop places that left the window
+    s.flowArcs = s.flowArcs.filter(a => {
+      if (keep.has(a.id)) return true;
+      s.globe.remove(a.line); s.globe.remove(a.dot);
+      a.geom.dispose(); a.line.material.dispose(); a.dot.material.dispose();
+      return false;
+    });
+
+    const h = ll(HOME[0], HOME[1], GR + 0.01);
+    for (const g of wanted) {
+      const w = Math.min(1, Math.log10(g.n + 1) / 2.5);           // 1 conn ≈ 0.12, 300+ ≈ 1
+      const old = s.flowArcs.find(a => a.id === g.key);
+      if (old) { old.weight = w; continue; }
+      const a = ll(g.ext[0], g.ext[1], GR + 0.01);
+      const from = g.dir === "outbound" ? h : a;
+      const to   = g.dir === "outbound" ? a : h;
       const curve = arcCurve(from, to);
-      const col = DIR_HEX[flow.direction] || DIR_HEX.external;
+      const col = DIR_HEX[g.dir];
 
       const geom = new THREE.BufferGeometry();
       const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false }));
@@ -726,14 +768,8 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       dot.position.copy(from);
       s.globe.add(dot);
 
-      s.flowArcs.push({ id: arcId, curve, geom, line, dot, t: Math.random() * 0.2, speed: 0.004 + Math.random() * 0.004 });
-
-      if (s.flowArcs.length > 90) {
-        const old = s.flowArcs.shift();
-        s.globe.remove(old.line); s.globe.remove(old.dot);
-        old.geom.dispose(); old.line.material.dispose(); old.dot.material.dispose();
-      }
-    });
+      s.flowArcs.push({ id: g.key, curve, geom, line, dot, weight: w, t: Math.random(), speed: (0.003 + Math.random() * 0.003) * (_reduceMotion ? 0.4 : 1) });
+    }
   }, [flows.length, flows[0]?.id, geoV, showAllTraffic]);
 
   // ── Derived stats for sidebar ─────────────────────────────────────────────────
@@ -757,6 +793,19 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
   ).map(([, v]) => ({ ...v, city: Object.entries(v.cities).sort((a, b) => b[1] - a[1])[0]?.[0] || "" }))
    .sort((a, b) => b.hits - a.hits).slice(0, 6);
 
+  // Ordinary connections (not alerts) by country, split into what comes in and what goes out.
+  const topFlow = Object.values(
+    flows.slice(0, 1500).reduce((acc, f) => {
+      if (!f.ext_ip || _isPrivate3d(f.ext_ip)) return acc;
+      const cc = _geo3d[f.ext_ip]?.cc || (/^[A-Z]{2}$/.test(f.country || "") ? f.country : "");
+      const k = cc || "??";
+      if (!acc[k]) acc[k] = { country: cc, label: countryName(cc, "Unknown"), inb: 0, out: 0, hits: 0 };
+      acc[k].hits++; f.direction === "outbound" ? acc[k].out++ : f.direction === "inbound" ? acc[k].inb++ : null;
+      return acc;
+    }, {})
+  ).sort((a, b) => b.hits - a.hits).slice(0, 6);
+  const flowTotals = topFlow.reduce((t, r) => ({ inb: t.inb + r.inb, out: t.out + r.out }), { inb: 0, out: 0 });
+
   const SC = { critical: "#ff2d55", high: "#ff9f0a", medium: "#ffd60a", low: "#64d2ff", info: "#0a84ff" };
   const totalHits = topAtk.reduce((s, a) => s + a.hits, 0);
 
@@ -777,6 +826,11 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           {showAllTraffic ? "ALL TRAFFIC" : "ALERTS ONLY"}
         </button>
         <span style={{ fontSize:10, color:"#6b7a90", fontFamily:"monospace" }}>{totalHits.toLocaleString()} alerts mapped</span>
+        {[["+", "Zoom in", 0.8], ["−", "Zoom out", 1.25]].map(([g, l, f]) => (
+          <button key={l} onClick={() => zoomBy(f)} title={`${l} (or scroll over the globe)`} aria-label={l}
+            style={{ pointerEvents:"auto", cursor:"pointer", width:26, height:24, borderRadius:7, border:"1px solid #1a2535",
+              background:"rgba(2,4,9,0.6)", color:"#8e8e93", fontFamily:"monospace", fontSize:13, lineHeight:1 }}>{g}</button>
+        ))}
         <button onClick={recentre} title="Centre on home (or double-click the globe)" aria-label="Centre the globe on home"
           style={{ pointerEvents:"auto", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", width:26, height:24,
             borderRadius:7, border:"1px solid #1a2535", background:"rgba(2,4,9,0.6)", color:"#8e8e93" }}>
@@ -789,7 +843,8 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
 
       {/* ── Legend ── */}
       <div style={{ position:"absolute", bottom:14, left:14, zIndex:20, display:"flex", gap:10, background:"rgba(2,4,9,0.82)", padding:"6px 12px", borderRadius:8, border:"1px solid #1a2535", pointerEvents:"none" }}>
-        {[["#30d158","Home (LU)"],["#ff2d55","Critical"],["#ff9f0a","High"],["#ffd60a","Medium"],["#64d2ff","Low"]].map(([c,l])=>(
+        {[["#30d158","Home (LU)"],["#ff2d55","Critical"],["#ff9f0a","High"],["#ffd60a","Medium"],["#64d2ff","Low"],
+          ...(showAllTraffic ? [["#30d1c0","Traffic in"],["#0a84ff","Traffic out"]] : [])].map(([c,l])=>(
           <span key={l} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:"#8e8e93", fontFamily:"monospace" }}>
             <span style={{ width:7, height:7, borderRadius:"50%", background:c, display:"inline-block", boxShadow:`0 0 6px ${c}` }}/>
             {l}
@@ -798,7 +853,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       </div>
 
       {/* ── Top Attack Origins sidebar ── */}
-      <div style={{ position:"absolute", top:44, right:12, zIndex:20, width:188, background:"rgba(2,4,9,0.88)", borderRadius:10, border:"1px solid #1a2535", padding:"10px 12px" }}>
+      <div style={{ position:"absolute", top:44, right:12, zIndex:20, width:208, maxHeight:"calc(100% - 96px)", overflowY:"auto", background:"rgba(2,4,9,0.88)", borderRadius:10, border:"1px solid #1a2535", padding:"10px 12px" }}>
         <div style={{ fontSize:9, fontWeight:700, color:"#4a5568", letterSpacing:"0.13em", marginBottom:10, fontFamily:"monospace", display:"flex", alignItems:"center", gap:4 }}>
           <TrendingUp size={9}/> TOP EXTERNAL ENDPOINTS
         </div>
@@ -809,7 +864,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
               <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:2 }}>
                 <span style={{ fontSize:9, color:"#4a5568", fontFamily:"monospace", width:12, textAlign:"right", flexShrink:0 }}>{i + 1}</span>
                 <span title={a.ip} style={{ fontSize:10, color:"white", fontFamily:"monospace", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                  {FLAG[a.country] || "🌐"} {a.label || a.ip || "Unknown"}
+                  {flagOf(a.country)} {a.label || a.ip || "Unknown"}
                 </span>
                 <span style={{ fontSize:10, fontWeight:700, color:col, fontFamily:"monospace" }}>{a.hits}</span>
               </div>
@@ -827,11 +882,28 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         {topAtk.length === 0 && (
           <div style={{ fontSize:9, color:"#6b7a90", fontFamily:"monospace", textAlign:"center", padding:"10px 0" }}>No alerts with an external address yet</div>
         )}
+        {showAllTraffic && topFlow.length > 0 && (
+          <div style={{ borderTop:"1px solid #1a2535", marginTop:6, paddingTop:9 }}>
+            <div style={{ fontSize:9, fontWeight:700, color:"#4a5568", letterSpacing:"0.13em", marginBottom:8, fontFamily:"monospace", display:"flex", alignItems:"center", gap:4 }}>
+              <Activity size={9}/> TRAFFIC
+              <span style={{ marginLeft:"auto", letterSpacing:0, fontWeight:400, color:"#6b7a90" }}>
+                <span style={{ color:"#30d1c0" }}>↓{flowTotals.inb}</span> <span style={{ color:"#0a84ff" }}>↑{flowTotals.out}</span>
+              </span>
+            </div>
+            {topFlow.map(r => (
+              <div key={r.country || "??"} style={{ display:"flex", alignItems:"center", gap:6, marginBottom:5, fontSize:10, fontFamily:"monospace" }}>
+                <span style={{ color:"white", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{flagOf(r.country)} {r.label}</span>
+                <span title="Connections coming in" style={{ color:"#30d1c0", minWidth:30, textAlign:"right" }}>{r.inb ? `↓${r.inb}` : ""}</span>
+                <span title="Connections going out" style={{ color:"#0a84ff", minWidth:30, textAlign:"right" }}>{r.out ? `↑${r.out}` : ""}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* ── Drag hint ── */}
       <div style={{ position:"absolute", bottom:14, right:14, zIndex:20, fontSize:9, color:"#4a5568", fontFamily:"monospace", pointerEvents:"none" }}>
-        Drag to rotate, double-click to centre
+        Drag to rotate, scroll to zoom, double-click to centre
       </div>
     </div>
   );
