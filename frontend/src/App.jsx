@@ -59,9 +59,9 @@ function genTraffic(t, ddos) {
   };
 }
 
-function blankTrafficPoint() {
+function blankTrafficPoint(at = Date.now()) {
   return {
-    time: new Date().toLocaleTimeString("en", {
+    time: new Date(at).toLocaleTimeString("en", {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
@@ -303,6 +303,15 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     homeView:{x:0,y:0}, tween:null, zoom:6.4, zoomTarget:6.4,
   });
   const [geoV, setGeoV] = useState(0);
+  // Arc effects can run before three.js has loaded; this re-runs them once the scene exists.
+  const [sceneReady, setSceneReady] = useState(false);
+  // Flows carry no id and the list is capped, so neither length nor flows[0].id changes:
+  // redraw traffic at most every 2 s, keyed on the newest flow object.
+  const flowTick = useRef({ ref: null, at: 0, v: 0 });
+  if (flows[0] !== flowTick.current.ref && Date.now() - flowTick.current.at > 2000) {
+    flowTick.current = { ref: flows[0], at: Date.now(), v: flowTick.current.v + 1 };
+  }
+  const flowV = flowTick.current.v;
 
   const GR = 2; // globe radius
   const HOME = [49.61, 6.13]; // Luxembourg
@@ -528,7 +537,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           // Move particle dot
           arc.dot.position.copy(arc.curve.getPoint(progress));
           arc.dot.material.opacity = arc.t < 1 ? 0.95 : Math.max(0, (1.8 - arc.t) * 2.2);
-          const ps = 0.7 + 0.5 * Math.sin(s.t * 10 + arc.phase);
+          const ps = (0.7 + 0.5 * Math.sin(s.t * 10 + arc.phase)) * zs;
           arc.dot.scale.setScalar(ps);
           // Impact pulse at home when arc first arrives
           if (arc.t >= 1 && !arc.pulsed && arc.inbound && !_reduceMotion) {
@@ -562,9 +571,10 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           for (let i = 0; i <= count; i++) pts.push(arc.curve.getPoint(i / 60));
           arc.geom.setFromPoints(pts);
           arc.dot.position.copy(arc.curve.getPoint(progress));
+          arc.dot.scale.setScalar(zs);
           const w = arc.weight ?? 0.5;
-          arc.dot.material.opacity = (arc.t < 1 ? 0.35 + 0.5 * w : Math.max(0, (1.4 - arc.t) * 1.5));
-          arc.line.material.opacity = arc.t > 1 ? Math.max(0.05 + 0.1 * w, (1.4 - arc.t) * 0.5) : 0.08 + 0.3 * w;
+          arc.dot.material.opacity = (arc.t < 1 ? 0.55 + 0.45 * w : Math.max(0, (1.4 - arc.t) * 1.5));
+          arc.line.material.opacity = arc.t > 1 ? Math.max(0.14 + 0.2 * w, (1.4 - arc.t) * 0.6) : 0.2 + 0.4 * w;
         });
 
         // Animate & prune impact rings
@@ -573,7 +583,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
             const age = s.t - ring.userData.birth;
             const maxAge = 1.8 + ring.userData.ri * 0.6;
             if (age > maxAge) { s.globe.remove(ring); ring.material.dispose(); ring.geometry.dispose(); return false; }
-            const sc = 1 + age * 4.5;
+            const sc = (1 + age * 4.5) * zs;
             ring.scale.setScalar(sc);
             ring.material.opacity = Math.max(0, 0.7 * (1 - age / maxAge));
             return true;
@@ -583,6 +593,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         s.renderer.render(s.scene, s.camera);
       };
       animate();
+      setSceneReady(true);
 
       // ── Drag to rotate ──
       const el = s.renderer.domElement;
@@ -607,8 +618,11 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       };
       el.addEventListener("mousedown", dn);
       el.addEventListener("dblclick", recentre);
-      // Wheel zoom only while the pointer is over the globe; the page scrolls normally elsewhere.
-      const wh = e => { e.preventDefault(); zoomBy(Math.exp(e.deltaY * 0.0012)); };
+      // Ctrl/⌘ + wheel zooms (trackpad pinch arrives as ctrl+wheel); a plain wheel keeps scrolling the page.
+      const wh = e => {
+        if (!(e.ctrlKey || e.metaKey)) return;
+        e.preventDefault(); zoomBy(Math.exp(e.deltaY * (Math.abs(e.deltaY) < 20 ? 0.01 : 0.0012)));
+      };
       el.addEventListener("wheel", wh, { passive: false });
       window.addEventListener("mousemove", mv);
       window.addEventListener("mouseup", up);
@@ -635,6 +649,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         if (mountRef.current?.contains(el)) mountRef.current.removeChild(el);
         s.renderer.dispose();
         s.ready = false;
+        setSceneReady(false);
       };
     });
     return () => S.current._cleanup?.();
@@ -711,7 +726,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         old.geom.dispose(); old.line.material.dispose(); old.dot.material.dispose();
       }
     });
-  }, [alerts.length, alerts[0]?.id, geoV]);
+  }, [alerts.length, alerts[0]?.id, geoV, sceneReady]);
 
   // ── Resolve GeoIPs for flow external endpoints ───────────────────────────────
   useEffect(() => {
@@ -719,7 +734,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     const ips = [...new Set(flows.map(f => f.ext_ip).filter(ip => ip && !_isPrivate3d(ip)))];
     const unknown = ips.filter(ip => !_geo3d[ip]);
     if (unknown.length) _resolveGeo3d(unknown, backendUrl).then(ok => { if (ok) setGeoV(v => v + 1); });
-  }, [flows.length, flows[0]?.id, showAllTraffic]);
+  }, [flowV, showAllTraffic]);
 
   // ── Add dim arcs for all-traffic flows ───────────────────────────────────────
   useEffect(() => {
@@ -774,13 +789,13 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       const geom = new THREE.BufferGeometry();
       const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false }));
       s.globe.add(line);
-      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false }));
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.024, 8, 8), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false }));
       dot.position.copy(from);
       s.globe.add(dot);
 
       s.flowArcs.push({ id: g.key, curve, geom, line, dot, weight: w, t: Math.random(), speed: (0.003 + Math.random() * 0.003) * (_reduceMotion ? 0.4 : 1) });
     }
-  }, [flows.length, flows[0]?.id, geoV, showAllTraffic]);
+  }, [flowV, geoV, showAllTraffic, sceneReady]);
 
   // ── Derived stats for sidebar ─────────────────────────────────────────────────
   const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
@@ -837,7 +852,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         </button>
         <span style={{ fontSize:10, color:"#6b7a90", fontFamily:"monospace" }}>{totalHits.toLocaleString()} alerts mapped</span>
         {[["+", "Zoom in", 0.8], ["−", "Zoom out", 1.25]].map(([g, l, f]) => (
-          <button key={l} onClick={() => zoomBy(f)} title={`${l} (or scroll over the globe)`} aria-label={l}
+          <button key={l} onClick={() => zoomBy(f)} title={`${l} (or Ctrl + scroll over the globe)`} aria-label={l}
             style={{ pointerEvents:"auto", cursor:"pointer", width:26, height:24, borderRadius:7, border:"1px solid #1a2535",
               background:"rgba(2,4,9,0.6)", color:"#8e8e93", fontFamily:"monospace", fontSize:13, lineHeight:1 }}>{g}</button>
         ))}
@@ -913,7 +928,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
 
       {/* ── Drag hint ── */}
       <div style={{ position:"absolute", bottom:14, right:14, zIndex:20, fontSize:9, color:"#4a5568", fontFamily:"monospace", pointerEvents:"none" }}>
-        Drag to rotate, scroll to zoom, double-click to centre
+        Drag to rotate, Ctrl + scroll to zoom, double-click to centre
       </div>
     </div>
   );
@@ -1828,7 +1843,7 @@ function Dashboard({ alerts, traffic, stats, backendUrl, apiKey, flows = [], sho
               <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#ff2d55" stopOpacity={0.5}/><stop offset="95%" stopColor="#ff2d55" stopOpacity={0}/></linearGradient>
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke="#21262d"/>
-            <XAxis dataKey="time" stroke="#4a5568" tick={{fontSize:10}} interval="preserveStartEnd"/>
+            <XAxis dataKey="time" stroke="#4a5568" tick={{fontSize:10}} interval="preserveStartEnd" minTickGap={56}/>
             <YAxis stroke="#4a5568" tick={{fontSize:10}}/>
             <Tooltip contentStyle={{background:"#161b22",border:"1px solid #30363d",borderRadius:8,fontSize:12}}/>
             <Area type="monotone" dataKey="pps"  stroke="#0a84ff" fill="url(#g1)" strokeWidth={2} name="PPS"        dot={false}/>
@@ -3515,7 +3530,7 @@ export default function SnortVision() {
   const [flows,setFlows]     = useState([]);                       // all-traffic connection flows
   const [showAllTraffic,setShowAllTraffic] = useState(()=>loadSaved("showAllTraffic",true));
   const flowLastIdRef = useRef(0);
-  const [traffic,setTraffic] = useState(() => Array.from({ length: 40 }, () => blankTrafficPoint()));
+  const [traffic,setTraffic] = useState(() => Array.from({ length: 40 }, (_, i) => blankTrafficPoint(Date.now() - (40 - i) * 1200)));
   const [newIds,setNewIds]   = useState(new Set());
   const [toasts,setToasts]   = useState([]);
   const [ddosMode,setDdosMode] = useState(false);
