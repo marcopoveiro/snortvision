@@ -32,6 +32,11 @@ services:
       - SNORT_SSH_USER=${SNORT_SSH_USER:-snort}
       - SNORT_SSH_KEY_PATH=/app/keys/snort_id_rsa
       - SNORT_LOG_PATH=${SNORT_LOG_PATH:-/var/log/snort/alert_json.txt}
+      # All-traffic flow log written by the Snort extractor (conn events)
+      - SNORT_FLOW_LOG_PATH=${SNORT_FLOW_LOG_PATH:-/var/log/snort/file_connector_sv_flows_transmit}
+      # Flow DB retention + per-second sampling cap (protects DB & browser)
+      - MAX_FLOWS=${MAX_FLOWS:-200000}
+      - FLOW_MAX_PER_SEC=${FLOW_MAX_PER_SEC:-40}
       - SENSOR_INTERFACE=${SENSOR_INTERFACE:-}
       - DDOS_PACKET_PPS_THRESHOLD=${DDOS_PACKET_PPS_THRESHOLD:-8000}
       - DDOS_ALERT_RATE_THRESHOLD=${DDOS_ALERT_RATE_THRESHOLD:-20}

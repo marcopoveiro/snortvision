@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, Fragment } from "react";
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import {
   Shield, AlertTriangle, Activity, Bell, Terminal, Wifi, Database,
@@ -272,11 +272,11 @@ function _isPrivate3d(ip) {
 }
 
 // ─── 3D Cyberthreat Globe (Kaspersky-style) ───────────────────────────────────
-function GeoMap({ alerts, backendUrl }) {
+function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShowAllTraffic = ()=>{} }) {
   const mountRef = useRef(null);
   const S = useRef({   // all mutable Three.js state in one object to avoid stale closures
     scene:null, camera:null, renderer:null, globe:null,
-    arcs:[], markers:{}, rings:[], frame:null,
+    arcs:[], flowArcs:[], markers:{}, rings:[], frame:null,
     t:0, dragging:false, lastMouse:{x:0,y:0},
     vel:{x:0,y:0}, autoRot:false, autoTimer:null, ready:false,  // autoRot permanently off
   });
@@ -468,6 +468,20 @@ function GeoMap({ alerts, backendUrl }) {
           if (arc.t > 1) arc.line.material.opacity = Math.max(0, (1.8 - arc.t) * 0.45);
         });
 
+        // Animate flow arcs (all-traffic — dim, calm, no impact bursts)
+        s.flowArcs.forEach(arc => {
+          arc.t += arc.speed;
+          if (arc.t > 1.4) arc.t = 0;
+          const progress = Math.min(arc.t, 1);
+          const count = Math.max(2, Math.floor(60 * progress));
+          const pts = [];
+          for (let i = 0; i <= count; i++) pts.push(arc.curve.getPoint(i / 60));
+          arc.geom.setFromPoints(pts);
+          arc.dot.position.copy(arc.curve.getPoint(progress));
+          arc.dot.material.opacity = arc.t < 1 ? 0.6 : Math.max(0, (1.4 - arc.t) * 1.5);
+          if (arc.t > 1) arc.line.material.opacity = Math.max(0, (1.4 - arc.t) * 0.22);
+        });
+
         // Animate & prune impact rings
         if (s.impactRings) {
           s.impactRings = s.impactRings.filter(ring => {
@@ -602,6 +616,65 @@ function GeoMap({ alerts, backendUrl }) {
     });
   }, [alerts.length, geoV]);
 
+  // ── Resolve GeoIPs for flow external endpoints ───────────────────────────────
+  useEffect(() => {
+    if (!showAllTraffic) return;
+    const ips = [...new Set(flows.map(f => f.ext_ip).filter(ip => ip && !_isPrivate3d(ip)))];
+    const unknown = ips.filter(ip => !_geo3d[ip]);
+    if (unknown.length) _resolveGeo3d(unknown, backendUrl).then(ok => { if (ok) setGeoV(v => v + 1); });
+  }, [flows.length, showAllTraffic]);
+
+  // ── Add dim arcs for all-traffic flows ───────────────────────────────────────
+  useEffect(() => {
+    const s = S.current;
+    if (!s.ready || !s.globe || !window.THREE) return;
+    const THREE = window.THREE;
+
+    // Toggle off → clear any existing flow arcs
+    if (!showAllTraffic) {
+      s.flowArcs.forEach(a => { s.globe.remove(a.line); s.globe.remove(a.dot); a.geom.dispose(); a.line.material.dispose(); a.dot.material.dispose(); });
+      s.flowArcs = [];
+      return;
+    }
+
+    // outbound = cool blue, inbound = teal, other = violet
+    const DIR_HEX = { outbound: 0x0a84ff, inbound: 0x30d1c0, external: 0xbf5af2 };
+
+    flows.filter(f => f.ext_ip && !_isPrivate3d(f.ext_ip)).slice(0, 120).forEach((flow, idx) => {
+      const arcId = flow.id != null ? flow.id : `f${idx}`;
+      if (s.flowArcs.find(a => a.id === arcId)) return;
+
+      const geo = _geo3d[flow.ext_ip];
+      const ccCoord = COUNTRY_COORDS[flow.country] || COUNTRY_COORDS[geo?.cc];
+      const ext = geo ? [geo.lat, geo.lon] : ccCoord;
+      if (!ext) return;  // no coords yet — resolves later
+
+      // inbound traffic flows ext→home, outbound flows home→ext
+      const a = ll(ext[0], ext[1], GR + 0.01);
+      const h = ll(HOME[0], HOME[1], GR + 0.01);
+      const from = flow.direction === "outbound" ? h : a;
+      const to   = flow.direction === "outbound" ? a : h;
+      const mid  = new THREE.Vector3().addVectors(from, to).normalize().multiplyScalar(GR * (1.25 + Math.random() * 0.4));
+      const curve = new THREE.QuadraticBezierCurve3(from, mid, to);
+      const col = DIR_HEX[flow.direction] || DIR_HEX.external;
+
+      const geom = new THREE.BufferGeometry();
+      const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false }));
+      s.globe.add(line);
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false }));
+      dot.position.copy(from);
+      s.globe.add(dot);
+
+      s.flowArcs.push({ id: arcId, curve, geom, line, dot, t: Math.random() * 0.2, speed: 0.004 + Math.random() * 0.004 });
+
+      if (s.flowArcs.length > 90) {
+        const old = s.flowArcs.shift();
+        s.globe.remove(old.line); s.globe.remove(old.dot);
+        old.geom.dispose(); old.line.material.dispose(); old.dot.material.dispose();
+      }
+    });
+  }, [flows.length, geoV, showAllTraffic]);
+
   // ── Derived stats for sidebar ─────────────────────────────────────────────────
   const topAtk = Object.entries(
     alerts.slice(0, 500).reduce((acc, x) => {
@@ -629,7 +702,15 @@ function GeoMap({ alerts, backendUrl }) {
         <span style={{ fontSize:12, fontWeight:800, letterSpacing:"0.15em", color:"white", fontFamily:"monospace" }}>CYBERTHREAT</span>
         <span style={{ fontSize:12, fontWeight:300, letterSpacing:"0.1em", color:"#4a9eff", fontFamily:"monospace" }}>LIVE MAP</span>
         <span style={{ fontSize:10, color:"#ff2d55", marginLeft:4 }} className="animate-pulse">⬤ LIVE</span>
-        <span style={{ marginLeft:"auto", fontSize:10, color:"#4a5568", fontFamily:"monospace" }}>{totalHits.toLocaleString()} attacks tracked</span>
+        <button onClick={()=>setShowAllTraffic(v=>!v)} title="Toggle all-traffic flows (Wireshark-style) vs. alerts only"
+          style={{ marginLeft:"auto", pointerEvents:"auto", cursor:"pointer", display:"flex", alignItems:"center", gap:6,
+            fontSize:10, fontFamily:"monospace", padding:"4px 10px", borderRadius:7,
+            border:`1px solid ${showAllTraffic?"#0a84ff":"#1a2535"}`, background:showAllTraffic?"#0a84ff22":"rgba(2,4,9,0.6)",
+            color:showAllTraffic?"#4a9eff":"#8e8e93" }}>
+          {showAllTraffic ? <Eye size={11}/> : <EyeOff size={11}/>}
+          {showAllTraffic ? "ALL TRAFFIC" : "ALERTS ONLY"}
+        </button>
+        <span style={{ fontSize:10, color:"#4a5568", fontFamily:"monospace" }}>{totalHits.toLocaleString()} attacks tracked</span>
       </div>
 
       {/* ── 3D Canvas ── */}
@@ -812,8 +893,17 @@ function SnortAPIPanel({ backendUrl, setBackendUrl, apiKey, setApiKey, status, s
         setStatus("connected"); setDbStats(data);
         // Show masked key from backend (key is immutable, generated on first run)
         if(data.api_key_masked) { setMaskedKey(data.api_key_masked); setApiKeyLocked(true); }
-        // Auto-save backendUrl to .env
-        try { await fetch(`${backendUrl}/api/config/env/bulk`,{method:"POST",headers:{"X-API-Key":apiKey,"Content-Type":"application/json"},body:JSON.stringify({BACKEND_URL:backendUrl})}); } catch {}
+        // Auto-save backendUrl to .env — but only persist a genuinely public
+        // URL. Saving a LAN session value (e.g. http://192.168.1.20:3000) would
+        // clobber a working reverse-proxy domain and break access via that domain.
+        try {
+          const u = new URL(backendUrl);
+          const isPrivate = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(u.hostname);
+          const appPort = u.port === "3000" || u.port === "4000";
+          if(!isPrivate && !appPort) {
+            await fetch(`${backendUrl}/api/config/env/bulk`,{method:"POST",headers:{"X-API-Key":apiKey,"Content-Type":"application/json"},body:JSON.stringify({BACKEND_URL:backendUrl})});
+          }
+        } catch {}
       } else { setVerifyResult({ok:false,msg:`HTTP ${res.status}`}); setStatus("error"); }
     } catch(e) { setVerifyResult({ok:false,msg:`Network error: ${e.message}`}); setStatus("error"); }
     setVerifying(false);
@@ -1541,7 +1631,7 @@ function ServiceControlPanel({ backendUrl, apiKey, status }) {
   );
 }
 
-function Dashboard({ alerts, traffic, stats, backendUrl }) {
+function Dashboard({ alerts, traffic, stats, backendUrl, apiKey, flows = [], showAllTraffic = true, setShowAllTraffic = ()=>{} }) {
   const catData = Object.entries(alerts.slice(0,300).reduce((a,x)=>{a[x.category]=(a[x.category]||0)+1;return a;},{}))
     .map(([name,value])=>({name,value,fill:CATC[name]||"#0a84ff"})).sort((a,b)=>b.value-a.value).slice(0,7);
   const sevData = ["critical","high","medium","low"].map(s=>({ name:s.toUpperCase(), value:alerts.filter(a=>a.severity===s).length, color:SEV[s].color }));
@@ -1638,7 +1728,190 @@ function Dashboard({ alerts, traffic, stats, backendUrl }) {
         </div>
       </div>
       {/* GeoIP Map */}
-      <GeoMap alerts={alerts} backendUrl={backendUrl}/>
+      <GeoMap alerts={alerts} backendUrl={backendUrl} flows={flows} showAllTraffic={showAllTraffic} setShowAllTraffic={setShowAllTraffic}/>
+      {/* Live connection table (Wireshark-style, all traffic) */}
+      <LiveConnections flows={flows} backendUrl={backendUrl} apiKey={apiKey}/>
+    </div>
+  );
+}
+
+// ─── Live connection feed (all traffic, Wireshark-style) ─────────────────────
+function LiveConnections({ flows = [], backendUrl, apiKey }) {
+  const [dir,setDir]     = useState("all");          // all | inbound | outbound | internal
+  const [q,setQ]         = useState("");
+  const [sort,setSort]   = useState({ key:"ts", dir:"desc" });
+  const [openId,setOpenId] = useState(null);
+  const [inclInternal,setInclInternal] = useState(false);
+  const [intBusy,setIntBusy] = useState(false);
+
+  // Load + toggle the backend "capture internal LAN/VLAN flows" option
+  useEffect(()=>{
+    if(!backendUrl) return;
+    fetch(`${backendUrl}/api/flows/options`, { headers: apiKey?{"X-API-Key":apiKey}:{} })
+      .then(r=>r.json()).then(d=>setInclInternal(!!d.includeInternal)).catch(()=>{});
+  },[backendUrl, apiKey]);
+  async function toggleInternal(){
+    if(!backendUrl) return;
+    setIntBusy(true);
+    const next = !inclInternal;
+    try {
+      const r = await fetch(`${backendUrl}/api/flows/options`, { method:"POST",
+        headers:{ "Content-Type":"application/json", ...(apiKey?{"X-API-Key":apiKey}:{}) },
+        body: JSON.stringify({ includeInternal: next }) });
+      const d = await r.json();
+      setInclInternal(!!d.includeInternal);
+    } catch(_){ } finally { setIntBusy(false); }
+  }
+
+  const DIR_COL  = { inbound:"#ff9f0a", outbound:"#0a84ff", external:"#bf5af2", internal:"#5e9ca0" };
+  const DIR_LBL  = { inbound:"◀ IN", outbound:"OUT ▶", external:"↔ EXT", internal:"⇄ LAN" };
+  const PROTO_COL= { TCP:"#0a84ff", UDP:"#30d158", ICMP:"#ff9f0a", IP:"#bf5af2" };
+  const fmtBytes = n => n>=1e9?(n/1e9).toFixed(2)+" GB":n>=1e6?(n/1e6).toFixed(1)+" MB":n>=1e3?(n/1e3).toFixed(1)+" KB":(n||0)+" B";
+  const bytesOf  = f => (f.orig_bytes||0)+(f.resp_bytes||0);
+  const fmtDur   = s => s>=60?`${Math.floor(s/60)}m ${s%60}s`:`${s||0}s`;
+
+  // ── filter ──
+  const filtered = flows.filter(f=>{
+    if(dir!=="all" && f.direction!==dir) return false;
+    if(q){ const s=q.toLowerCase(); if(!(`${f.src_ip} ${f.dst_ip} ${f.service} ${f.country} ${f.proto} ${f.dst_port}`).toLowerCase().includes(s)) return false; }
+    return true;
+  });
+
+  // ── summary stats (over filtered) ──
+  const stat = filtered.reduce((a,f)=>{
+    a.bytes += bytesOf(f);
+    if(f.direction==="inbound") a.in++; else if(f.direction==="outbound") a.out++;
+    a.ips.add(f.ext_ip);
+    if(f.country){ a.cc[f.country]=(a.cc[f.country]||0)+1; }
+    return a;
+  }, { bytes:0, in:0, out:0, ips:new Set(), cc:{} });
+  const topCC = Object.entries(stat.cc).sort((x,y)=>y[1]-x[1])[0];
+
+  // ── sort ──
+  const getv = (f,k)=> k==="ts"?new Date(f.ts).getTime() : k==="bytes"?bytesOf(f) : k==="port"?(f.dst_port||0) : (f[k]??"");
+  const rows = [...filtered].sort((a,b)=>{
+    const va=getv(a,sort.key), vb=getv(b,sort.key);
+    const c = typeof va==="number" ? va-vb : String(va).localeCompare(String(vb));
+    return sort.dir==="asc"?c:-c;
+  }).slice(0,200);
+  const maxBytes = Math.max(1, ...rows.map(bytesOf));
+
+  const setSortKey = k => setSort(s => s.key===k ? { key:k, dir:s.dir==="asc"?"desc":"asc" } : { key:k, dir:"desc" });
+  const COLS = [["ts","Time"],["direction","Dir"],["src_ip","Source"],["dst_ip","Destination"],["port","Port"],["proto","Proto"],["service","Service"],["country","Geo"],["bytes","Bytes"]];
+
+  const Chip = ({label,value,color}) => (
+    <div style={{ display:"flex", flexDirection:"column", gap:2, padding:"0 14px", borderLeft:"1px solid #14202f" }}>
+      <span style={{ fontSize:9, letterSpacing:"0.12em", color:"#4a5568", fontFamily:"monospace" }}>{label}</span>
+      <span style={{ fontSize:14, fontWeight:800, color:color||"#e5e7eb", fontFamily:"monospace" }}>{value}</span>
+    </div>
+  );
+
+  return (
+    <div style={{ borderRadius:14, border:"1px solid #1a2535", background:"#020409", overflow:"hidden" }}>
+      {/* Title + filters */}
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 16px", borderBottom:"1px solid #1a2535", flexWrap:"wrap" }}>
+        <Activity size={13} style={{ color:"#4a9eff" }}/>
+        <span style={{ fontSize:12, fontWeight:800, letterSpacing:"0.13em", color:"white", fontFamily:"monospace" }}>LIVE CONNECTIONS</span>
+        <span style={{ fontSize:10, color:"#30d158" }} className="animate-pulse">⬤ ALL TRAFFIC</span>
+        <div style={{ display:"flex", gap:4, marginLeft:8 }}>
+          {["all","inbound","outbound","internal"].map(d=>(
+            <button key={d} onClick={()=>setDir(d)}
+              style={{ fontSize:10, fontFamily:"monospace", padding:"3px 9px", borderRadius:6, cursor:"pointer",
+                border:`1px solid ${dir===d?"#4a9eff":"#1a2535"}`, background:dir===d?"#0a84ff22":"transparent",
+                color:dir===d?"#4a9eff":"#8e8e93" }}>{d.toUpperCase()}</button>
+          ))}
+        </div>
+        <button onClick={toggleInternal} disabled={intBusy||!backendUrl}
+          title="Capture LAN/VLAN internal traffic (needs a port mirror feeding the sensor). Off = external traffic only."
+          style={{ display:"flex", alignItems:"center", gap:5, fontSize:10, fontFamily:"monospace", padding:"4px 9px", borderRadius:6, cursor:"pointer",
+            border:`1px solid ${inclInternal?"#30d158":"#1a2535"}`, background:inclInternal?"#30d15822":"transparent",
+            color:inclInternal?"#30d158":"#8e8e93", opacity:intBusy?0.5:1 }}>
+          {inclInternal?<Eye size={11}/>:<EyeOff size={11}/>}{inclInternal?"INTERNAL ON":"INTERNAL OFF"}
+        </button>
+        <div style={{ position:"relative", marginLeft:"auto" }}>
+          <Search size={12} style={{ position:"absolute", left:8, top:7, color:"#4a5568" }}/>
+          <input value={q} onChange={e=>setQ(e.target.value)} placeholder="Filter IP / service / country / port…"
+            style={{ background:"#0a0e16", border:"1px solid #1a2535", borderRadius:6, padding:"4px 8px 4px 26px",
+              fontSize:11, color:"white", fontFamily:"monospace", width:240, outline:"none" }}/>
+        </div>
+      </div>
+
+      {/* Summary stat strip */}
+      <div style={{ display:"flex", alignItems:"center", padding:"10px 6px", borderBottom:"1px solid #1a2535", background:"#04070d", overflowX:"auto" }}>
+        <Chip label="FLOWS" value={filtered.length.toLocaleString()} color="#4a9eff"/>
+        <Chip label="◀ INBOUND"  value={stat.in.toLocaleString()}  color="#ff9f0a"/>
+        <Chip label="OUTBOUND ▶" value={stat.out.toLocaleString()} color="#0a84ff"/>
+        <Chip label="EXT HOSTS" value={stat.ips.size.toLocaleString()}/>
+        <Chip label="VOLUME" value={fmtBytes(stat.bytes)} color="#30d158"/>
+        <Chip label="TOP GEO" value={topCC?`${topCC[0]} (${topCC[1]})`:"—"} color="#bf5af2"/>
+      </div>
+
+      <div style={{ maxHeight:360, overflowY:"auto" }}>
+        <table style={{ width:"100%", borderCollapse:"collapse", fontFamily:"monospace", fontSize:11 }}>
+          <thead>
+            <tr style={{ position:"sticky", top:0, background:"#070b12", color:"#4a5568", textAlign:"left", zIndex:2 }}>
+              {COLS.map(([k,label])=>(
+                <th key={k} onClick={()=>setSortKey(k)}
+                  style={{ padding:"8px 12px", fontWeight:700, letterSpacing:"0.06em", borderBottom:"1px solid #1a2535", cursor:"pointer", whiteSpace:"nowrap", userSelect:"none" }}>
+                  {label}{sort.key===k && <span style={{ color:"#4a9eff", marginLeft:4 }}>{sort.dir==="asc"?"▲":"▼"}</span>}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length===0 && (
+              <tr><td colSpan={COLS.length} style={{ padding:"28px 12px", textAlign:"center", color:"#4a5568" }}>
+                {flows.length ? "No flows match the current filter." : "Waiting for connection flows from the Snort extractor…"}
+              </td></tr>
+            )}
+            {rows.map(f=>{
+              const tot = bytesOf(f);
+              const open = openId===f.id;
+              return (
+                <Fragment key={f.id}>
+                  <tr onClick={()=>setOpenId(open?null:f.id)}
+                    style={{ borderBottom:"1px solid #0d141f", cursor:"pointer", background:open?"#0a0f18":"transparent" }}>
+                    <td style={{ padding:"6px 12px", color:"#6b7688", whiteSpace:"nowrap" }}>{new Date(f.ts).toLocaleTimeString("en",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}</td>
+                    <td style={{ padding:"6px 12px" }}><span style={{ padding:"1px 7px", borderRadius:20, fontSize:9, fontWeight:700, color:DIR_COL[f.direction]||"#8e8e93", background:(DIR_COL[f.direction]||"#8e8e93")+"22" }}>{DIR_LBL[f.direction]||f.direction}</span></td>
+                    <td style={{ padding:"6px 12px", color:"#e5e7eb", whiteSpace:"nowrap" }}>{f.src_ip}<span style={{ color:"#3a4456" }}>:{f.src_port}</span></td>
+                    <td style={{ padding:"6px 12px", color:"#e5e7eb", whiteSpace:"nowrap" }}>{f.dst_ip}</td>
+                    <td style={{ padding:"6px 12px", color:"#8e8e93" }}>{f.dst_port||""}</td>
+                    <td style={{ padding:"6px 12px" }}><span style={{ color:PROTO_COL[f.proto]||"#8e8e93" }}>{f.proto}</span></td>
+                    <td style={{ padding:"6px 12px", color: f.service && f.service!=="unknown" ? "#30d158" : "#4a5568" }}>{f.service&&f.service!=="unknown"?f.service:"—"}</td>
+                    <td style={{ padding:"6px 12px", color:"#8e8e93", whiteSpace:"nowrap" }}>{f.country||"—"}{f.city?<span style={{ color:"#4a5568" }}> · {f.city}</span>:null}</td>
+                    <td style={{ padding:"6px 12px", color:"#9ca7b8", whiteSpace:"nowrap", minWidth:96 }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                        <div style={{ flex:1, height:4, borderRadius:3, background:"#0d141f", overflow:"hidden" }}>
+                          <div style={{ width:`${Math.max(3,(tot/maxBytes)*100)}%`, height:"100%", borderRadius:3, background:DIR_COL[f.direction]||"#4a9eff" }}/>
+                        </div>
+                        <span>{fmtBytes(tot)}</span>
+                      </div>
+                    </td>
+                  </tr>
+                  {open && (
+                    <tr style={{ background:"#05080f" }}>
+                      <td colSpan={COLS.length} style={{ padding:"10px 16px", borderBottom:"1px solid #1a2535" }}>
+                        <div style={{ display:"flex", gap:26, flexWrap:"wrap", fontSize:11, color:"#8e8e93" }}>
+                          <span>flow #<b style={{ color:"#e5e7eb" }}>{f.id}</b></span>
+                          <span>↑ sent <b style={{ color:"#0a84ff" }}>{f.orig_pkts||0} pkts / {fmtBytes(f.orig_bytes||0)}</b></span>
+                          <span>↓ recv <b style={{ color:"#30d158" }}>{f.resp_pkts||0} pkts / {fmtBytes(f.resp_bytes||0)}</b></span>
+                          <span>duration <b style={{ color:"#e5e7eb" }}>{fmtDur(f.duration)}</b></span>
+                          <span>external <b style={{ color:"#bf5af2" }}>{f.ext_ip}</b></span>
+                          <span>{new Date(f.ts).toLocaleString()}</span>
+                        </div>
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ padding:"7px 16px", borderTop:"1px solid #1a2535", fontSize:10, color:"#4a5568", fontFamily:"monospace", display:"flex", gap:14 }}>
+        <span>showing {rows.length.toLocaleString()} of {filtered.length.toLocaleString()} {dir!=="all"?dir+" ":""}flows</span>
+        <span style={{ marginLeft:"auto" }}>click a row for detail · click a column to sort</span>
+      </div>
     </div>
   );
 }
@@ -1893,7 +2166,7 @@ function IpBlocklist({ blocklist, setBlocklist, autoBlock, setAutoBlock, backend
 }
 
 // ─── DDOS MITIGATION// ─── DDOS MITIGATION ─────────────────────────────────────────────────────────
-function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, setBlocklist, backendStats, backendStatus }) {
+function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, setBlocklist, backendStats, backendStatus, backendUrl, apiKey }) {
   const [mitMode,setMitMode]     = useState(()=>loadSaved("ddos_mitMode","auto"));
   const [rateLimits,setRateLimits] = useState(()=>loadSaved("ddos_rateLimits",{
     enabled: true, ppsThreshold: 5000, synFloodRate: 500, icmpRate: 200, udpRate: 1000,
@@ -1909,6 +2182,62 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
   useEffect(()=>{ saveSetting("ddos_geoBlock",   geoBlock);   }, [geoBlock]);
   useEffect(()=>{ saveSetting("ddos_synCookie",  synCookie);  }, [synCookie]);
   useEffect(()=>{ saveSetting("ddos_nullRoute",  nullRoute);  }, [nullRoute]);
+
+  // ── Real enforcement: push rate-limit / SYN-cookie / invalid-drop rules to
+  //    the router (nftables) or sensor (iptables) via the backend. ────────────
+  const [enforce,setEnforce] = useState(()=>loadSaved("ddos_enforce", false));
+  const [mit,setMit] = useState({ busy:false, active:false, engine:"", target:"", msg:"", err:"" });
+  useEffect(()=>{ saveSetting("ddos_enforce", enforce); }, [enforce]);
+
+  const mitApiRef = useRef({ backendUrl, apiKey });
+  useEffect(()=>{ mitApiRef.current = { backendUrl, apiKey }; }, [backendUrl, apiKey]);
+  const mitFetch = (path, opts={}) => {
+    const { backendUrl, apiKey } = mitApiRef.current;
+    return fetch(`${backendUrl}${path}`, { ...opts, headers:{ ...(apiKey?{"X-API-Key":apiKey}:{}), ...(opts.headers||{}) } });
+  };
+
+  async function applyMitigation(){
+    setMit(m=>({ ...m, busy:true, err:"" }));
+    try {
+      const r = await mitFetch("/api/mitigation/apply", { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ rateLimits, synCookie, nullRoute }) });
+      const d = await r.json();
+      if(!r.ok || d.ok===false){ setMit(m=>({ ...m, busy:false, active:false, err:d.message||"Apply failed", engine:d.engine||m.engine, target:d.target||m.target })); return; }
+      setMit({ busy:false, active:true, engine:d.engine||"", target:d.target||"", msg:"Rules applied", err:"" });
+    } catch(e){ setMit(m=>({ ...m, busy:false, err:e.message })); }
+  }
+  async function clearMitigation(){
+    setMit(m=>({ ...m, busy:true, err:"" }));
+    try {
+      const r = await mitFetch("/api/mitigation/clear", { method:"POST" });
+      const d = await r.json();
+      setMit({ busy:false, active:false, engine:d.engine||"", target:d.target||"", msg:"Rules cleared", err: r.ok?"":(d.message||"") });
+    } catch(e){ setMit(m=>({ ...m, busy:false, err:e.message })); }
+  }
+
+  // Load current enforcement status when connected
+  useEffect(()=>{
+    if(backendStatus!=="connected" || !backendUrl) return;
+    mitFetch("/api/mitigation/status").then(r=>r.json())
+      .then(d=>{ if(d && d.ok!==false) setMit(m=>({ ...m, active:!!d.active, engine:d.engine||"", target:d.target||"" })); })
+      .catch(()=>{});
+  },[backendStatus, backendUrl]);
+
+  // Master switch → apply when ON, clear when turned OFF
+  const enforceInit = useRef(false);
+  useEffect(()=>{
+    if(backendStatus!=="connected"){ enforceInit.current = true; return; }
+    if(enforce) applyMitigation();
+    else if(enforceInit.current) clearMitigation();
+    enforceInit.current = true;
+  },[enforce]);
+
+  // Re-apply (debounced) when rules change while enforcement is active
+  useEffect(()=>{
+    if(!enforce || backendStatus!=="connected") return;
+    const t = setTimeout(applyMitigation, 700);
+    return ()=>clearTimeout(t);
+  },[rateLimits, synCookie, nullRoute]);
 
   const ddosAlerts = alerts.filter(a=>a.category==="DDOS").sort((a,b)=>toAlertTimeMs(b.ts)-toAlertTimeMs(a.ts));
   const recentDdos = ddosAlerts.slice(0, 25);
@@ -2031,6 +2360,41 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
         </button>
       </div>
 
+      {/* ── Active Enforcement (pushes real firewall rules) ── */}
+      <div className="rounded-xl border p-4 flex items-center gap-3 flex-wrap"
+        style={{ borderColor: mit.active?"#ff2d5560":"#1f2937", background: mit.active?"rgba(255,45,85,0.06)":"#0a0e16" }}>
+        <div style={{ background: mit.active?"rgba(255,45,85,0.15)":"rgba(110,118,129,0.12)", color: mit.active?"#ff2d55":"#8e8e93" }}
+          className="w-9 h-9 rounded-lg flex items-center justify-center"><Shield size={17}/></div>
+        <div className="flex-1 min-w-[240px]">
+          <div className="text-sm font-bold text-white flex items-center gap-2">
+            Active Enforcement
+            {mit.active && <span className="text-xs font-mono text-red-400 animate-pulse">● LIVE</span>}
+            {mit.busy && <RefreshCw size={12} className="animate-spin text-gray-500"/>}
+          </div>
+          <div className="text-xs text-gray-500">
+            Applies the rate-limit / SYN-cookie / invalid-drop rules below as real firewall rules
+            {mit.target?<> on <span className="text-gray-300 font-mono">{mit.target}</span></>:" on the enforcement target"}
+            {mit.engine?<span className="text-gray-600"> ({mit.engine})</span>:null}.
+          </div>
+          {mit.err
+            ? <div className="text-xs text-red-400 mt-1 flex items-center gap-1"><AlertTriangle size={11}/>{mit.err}</div>
+            : mit.msg ? <div className="text-xs text-green-400/80 mt-1">{mit.msg}</div> : null}
+          {backendStatus!=="connected" && <div className="text-xs text-yellow-500/80 mt-1">Connect the Snort API first to enable enforcement.</div>}
+        </div>
+        {mit.active && (
+          <button onClick={clearMitigation} disabled={mit.busy}
+            className="text-xs px-3 py-2 rounded-lg border border-gray-700 text-gray-300 hover:border-red-700 hover:text-red-400 font-bold disabled:opacity-40 flex items-center gap-1.5">
+            <Ban size={12}/>Clear rules
+          </button>
+        )}
+        <button onClick={()=>setEnforce(p=>!p)} disabled={backendStatus!=="connected"||mit.busy}
+          title="Enforce / remove the firewall rules on the router or sensor"
+          style={{ background: enforce?"#ff2d55":"#21262d" }}
+          className="w-12 h-6 rounded-full relative transition-all disabled:opacity-40 flex-shrink-0">
+          <div style={{ left: enforce?"calc(100% - 22px)":"2px" }} className="absolute top-0.5 w-5 h-5 bg-white rounded-full transition-all"/>
+        </button>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Rate limiting */}
         <div className="rounded-xl border border-gray-800 bg-gray-950 p-4 space-y-3">
@@ -2115,7 +2479,7 @@ function DdosMitigation({ alerts, traffic, ddosMode, setDdosMode, blocklist, set
             )}
           </div>
           <div className="rounded-xl border border-gray-800 bg-gray-950 p-3">
-            <div className="text-xs font-bold text-gray-500 mb-2 flex items-center gap-1.5"><Hash size={11}/>Generated iptables rules</div>
+            <div className="text-xs font-bold text-gray-500 mb-2 flex items-center gap-1.5"><Hash size={11}/>Equivalent rules {mit.active?<span className="text-green-400">· enforced now</span>:<span className="text-gray-600">· enforce to apply</span>} <span className="text-gray-600">(OpenWRT applies via nftables)</span></div>
             <div className="bg-black rounded-lg p-2.5 font-mono text-xs text-green-400 space-y-0.5 max-h-28 overflow-auto">
               {rateLimits.enabled && <>
                 <div className="text-gray-500"># Rate limiting</div>
@@ -2654,6 +3018,20 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
     <div className="max-w-5xl space-y-4">
       <DependencyChain sshStatus={sshStatus} backendStatus={effectiveBackend} dbStatus={effectiveDb} snortStatus={effectiveSnort} routerStatus={routerStatus} router={router}/>
 
+      {/* Sticky section navigator */}
+      <nav style={{ position:"sticky", top:0, zIndex:30, display:"flex", gap:6, flexWrap:"wrap", padding:"8px 0",
+        background:"linear-gradient(180deg,#020409 72%,transparent)" }}>
+        {[["sec-backend","Backend & API",Wifi],["sec-sensor","Snort Sensor",Terminal],["sec-router","Router",Server],["sec-database","Database",Database],["sec-services","Services",RefreshCw]].map(([id,label,Icon])=>(
+          <a key={id} href={`#${id}`}
+            style={{ display:"flex", alignItems:"center", gap:6, fontSize:11, fontWeight:700, fontFamily:"monospace", letterSpacing:"0.04em",
+              padding:"6px 12px", borderRadius:8, border:"1px solid #1a2535", background:"#0a0e16", color:"#8e8e93", textDecoration:"none" }}>
+            <Icon size={12}/>{label}
+          </a>
+        ))}
+      </nav>
+
+      <div id="sec-backend" style={{ scrollMarginTop:64 }}/>
+
       <div className="rounded-xl border border-cyan-900/30 bg-cyan-950/10 p-4 text-sm text-cyan-100 space-y-2">
         <div className="font-bold flex items-center gap-2"><Radio size={14} className="text-cyan-400"/>Traffic source model</div>
         <div className="text-cyan-100/80 text-xs leading-5">
@@ -2667,7 +3045,7 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
         status={backendStatus} setStatus={setBackendStatus}
         dbStats={backendStats} setDbStats={setBackendStats}/>
 
-      <div className="rounded-xl border border-gray-800 bg-gray-950 p-5 space-y-3">
+      <div id="sec-sensor" className="rounded-xl border border-gray-800 bg-gray-950 p-5 space-y-3" style={{ scrollMarginTop:64 }}>
         <div className="flex items-center gap-2">
           <Terminal size={14} className="text-green-400"/>
           <span className="font-bold text-white">Snort Sensor — Alert Source & SSH</span>
@@ -2760,7 +3138,7 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
         )}
       </div>
 
-      <div className="rounded-xl border border-gray-800 bg-gray-950 p-5 space-y-4">
+      <div id="sec-router" className="rounded-xl border border-gray-800 bg-gray-950 p-5 space-y-4" style={{ scrollMarginTop:64 }}>
         <div className="flex items-center gap-2">
           <Server size={14} className="text-cyan-400"/>
           <span className="font-bold text-white">Main Router Connection</span>
@@ -2884,8 +3262,25 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
         </div>
       </div>
 
+      <div id="sec-database" style={{ scrollMarginTop:64 }}/>
+
+      {/* Database Explorer launcher */}
+      <div className="rounded-xl border border-blue-900/30 bg-blue-950/10 p-4 flex items-center gap-3 flex-wrap">
+        <Database size={16} className="text-blue-400"/>
+        <div className="flex-1 min-w-[200px]">
+          <div className="font-bold text-white text-sm">Database Explorer</div>
+          <div className="text-xs text-gray-500">Browse, search, sort and manage every table (alerts, flows, blocklist, rules…) in a dedicated professional viewer.</div>
+        </div>
+        <a href="/db" target="_blank" rel="noreferrer"
+          className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold flex items-center gap-2 transition-all">
+          <Database size={14}/>Open Explorer ↗
+        </a>
+      </div>
+
       <DatabasePanel backendUrl={backendUrl} apiKey={apiKey} backendStatus={backendStatus} dbStatus={dbStatus} setDbStatus={setDbStatus}/>
       <DbManagePanel backendUrl={backendUrl} apiKey={apiKey}/>
+
+      <div id="sec-services" style={{ scrollMarginTop:64 }}/>
       <SyncPanel backendUrl={backendUrl} apiKey={apiKey} status={backendStatus} router={router}/>
       <ServiceControlPanel backendUrl={backendUrl} apiKey={apiKey} status={backendStatus}/>
     </div>
@@ -2933,10 +3328,35 @@ if (typeof document !== "undefined") {
   document.documentElement.dataset.theme = loadSaved("theme", "dark");
 }
 
+// ─── Brand logo (shield + radar/scope = security + vision) ───────────────────
+function SnortVisionLogo({ size = 28 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ display:"block" }}>
+      <defs>
+        <linearGradient id="sv-logo-grad" x1="2" y1="1" x2="30" y2="31" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#ff2d55"/><stop offset="1" stopColor="#ff6b35"/>
+        </linearGradient>
+      </defs>
+      {/* shield */}
+      <path d="M16 1.8 L28 5.8 V15.2 C28 23 22.8 28.4 16 30.6 C9.2 28.4 4 23 4 15.2 V5.8 Z" fill="url(#sv-logo-grad)"/>
+      {/* inner darken */}
+      <path d="M16 4.6 L25.2 7.7 V15.2 C25.2 21.4 21.2 25.8 16 27.7 C10.8 25.8 6.8 21.4 6.8 15.2 V7.7 Z" fill="#1c0a10" fillOpacity="0.4"/>
+      {/* radar / scope */}
+      <circle cx="16" cy="14.8" r="6.4" stroke="#fff" strokeOpacity="0.92" strokeWidth="1.5"/>
+      <circle cx="16" cy="14.8" r="3.2" stroke="#fff" strokeOpacity="0.55" strokeWidth="1.1"/>
+      <circle cx="16" cy="14.8" r="1.15" fill="#fff"/>
+      <path d="M16 14.8 L21.4 10.9" stroke="#fff" strokeWidth="1.4" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
 // ─── APP ──────────────────────────────────────────────────────────────────────
 export default function SnortVision() {
   const [page,setPage]       = useState(()=>loadSaved("page","dashboard"));
   const [alerts,setAlerts]   = useState([]);
+  const [flows,setFlows]     = useState([]);                       // all-traffic connection flows
+  const [showAllTraffic,setShowAllTraffic] = useState(()=>loadSaved("showAllTraffic",true));
+  const flowLastIdRef = useRef(0);
   const [traffic,setTraffic] = useState(() => Array.from({ length: 40 }, () => blankTrafficPoint()));
   const [newIds,setNewIds]   = useState(new Set());
   const [toasts,setToasts]   = useState([]);
@@ -2953,9 +3373,10 @@ export default function SnortVision() {
     if (saved) {
       try {
         const u = new URL(saved);
-        // Strip any saved URL that hardcodes :4000 on a non-localhost host
-        // (would fail behind a reverse proxy). Use same-origin instead.
-        if (u.port === "4000" && u.hostname !== "localhost" && u.hostname !== "127.0.0.1") {
+        // Strip any saved URL that hardcodes the backend (:4000) or frontend
+        // (:3000) port on a non-localhost host — both fail behind a reverse
+        // proxy (which serves the SPA + /api on 443). Use same-origin instead.
+        if ((u.port === "4000" || u.port === "3000") && u.hostname !== "localhost" && u.hostname !== "127.0.0.1") {
           return getDefaultBackendUrl();
         }
         // Discard stale default placeholder IPs
@@ -2991,7 +3412,23 @@ export default function SnortVision() {
     if(backendUrl) return; // already have it
     fetch("/api/public/client-config")
       .then(r=>{ if(!r.ok) throw new Error("no config"); return r.json(); })
-      .then(cfg=>{ if(cfg.backendUrl) setBackendUrl(cfg.backendUrl); })
+      .then(cfg=>{
+        if(!cfg.backendUrl) return;
+        // The stored BACKEND_URL may have been auto-saved from a LAN session
+        // (e.g. http://192.168.1.20:3000). Behind a reverse proxy (Nginx Proxy
+        // Manager → frontend:3000, which proxies /api same-origin) that value is
+        // unreachable. Prefer same-origin whenever it points at a different host
+        // or an app port (3000/4000).
+        let target = cfg.backendUrl;
+        try {
+          const u = new URL(cfg.backendUrl);
+          const isLocal = u.hostname === "localhost" || u.hostname === "127.0.0.1";
+          const appPort = u.port === "3000" || u.port === "4000";
+          const sameHost = u.hostname === window.location.hostname;
+          if(!isLocal && (!sameHost || appPort)) target = getDefaultBackendUrl();
+        } catch { target = getDefaultBackendUrl(); }
+        setBackendUrl(target);
+      })
       .catch(()=>{}); // silently ignore — user can fill in manually
   },[]);
 
@@ -3217,6 +3654,32 @@ useEffect(()=>{
   return ()=>clearInterval(iv);
 }, []);
 
+// ── Poll backend for new all-traffic flows every 3 s when connected
+useEffect(()=>{
+  const poll = async ()=>{
+    const {url,key,status} = backendRef.current;
+    if(status !== "connected") return;
+    try {
+      const res = await fetch(
+        `${url}/api/flows/new?since=${flowLastIdRef.current}`,
+        { headers: key ? {"X-API-Key":key} : {} }
+      );
+      if(!res.ok) return;
+      const data = await res.json();
+      const raw  = data.flows || [];
+      if(raw.length > 0){
+        flowLastIdRef.current = Math.max(...raw.map(f=>f.id), flowLastIdRef.current);
+        // newest first, keep a rolling buffer
+        setFlows(p=>[...raw.reverse(), ...p].slice(0, 1500));
+      }
+    } catch(_){ }
+  };
+  const iv = setInterval(poll, 3000);
+  return ()=>clearInterval(iv);
+}, []);
+
+useEffect(()=>{ try{ localStorage.setItem("showAllTraffic", JSON.stringify(showAllTraffic)); }catch(_){} }, [showAllTraffic]);
+
 
 // Offline demo mode only. Never overwrite real backend traffic.
 useEffect(() => {
@@ -3343,12 +3806,10 @@ const isDdos = !!backendStats?.ddos_detected || (ddosMode && backendStatus !== "
       {/* Header */}
       <header style={{borderBottom:"1px solid var(--app-border)",background:"var(--app-panel)"}} className="sticky top-0 z-40 px-4 py-2.5 flex items-center gap-3">
         <div className="flex items-center gap-2 flex-shrink-0">
-          <div style={{background:"linear-gradient(135deg,#ff2d55,#ff6b35)"}} className="w-7 h-7 rounded-lg flex items-center justify-center">
-            <Shield size={14} className="text-white"/>
-          </div>
+          <SnortVisionLogo size={30}/>
           <div className="leading-none">
             <div className="text-sm font-black text-white">SnortVision</div>
-            <div className="text-xs text-gray-600">v0.1</div>
+            <div className="text-xs text-gray-600">v0.2</div>
           </div>
         </div>
 
@@ -3406,10 +3867,10 @@ const isDdos = !!backendStats?.ddos_detected || (ddosMode && backendStatus !== "
           <span className="text-sm font-bold text-gray-300">{NAV.find(n=>n.id===page)?.label}</span>
         </div>
 
-        {page==="dashboard"  && <Dashboard     alerts={alerts} traffic={traffic} stats={stats} backendUrl={backendUrl}/>}
+        {page==="dashboard"  && <Dashboard     alerts={alerts} traffic={traffic} stats={stats} backendUrl={backendUrl} apiKey={apiKey} flows={flows} showAllTraffic={showAllTraffic} setShowAllTraffic={setShowAllTraffic}/>}
         {page==="alerts"     && <Alerts         alerts={alerts} newIds={newIds} onBlockIp={onBlockIp}/>}
         {page==="blocklist"  && <IpBlocklist    blocklist={blocklist} setBlocklist={setBlocklist} autoBlock={autoBlock} setAutoBlock={setAutoBlock} backendUrl={backendUrl} apiKey={apiKey} backendStatus={backendStatus} onBlockIp={onBlockIp} router={router}/>}
-        {page==="ddos"       && <DdosMitigation alerts={alerts} traffic={traffic} ddosMode={ddosMode} setDdosMode={setDdosMode} blocklist={blocklist} setBlocklist={setBlocklist} backendStats={backendStats} backendStatus={backendStatus}/>}
+        {page==="ddos"       && <DdosMitigation alerts={alerts} traffic={traffic} ddosMode={ddosMode} setDdosMode={setDdosMode} blocklist={blocklist} setBlocklist={setBlocklist} backendStats={backendStats} backendStatus={backendStatus} backendUrl={backendUrl} apiKey={apiKey}/>}
         {page==="rules"      && <RulesManager/>}
         {page==="notif"      && <Notifications/>}
         {page==="connection" && <Connection host={host} setHost={setHost}

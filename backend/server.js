@@ -253,6 +253,25 @@ if (GEOIP_EN) {
   catch (_) { console.warn("[GeoIP] geoip-lite not installed — run: npm install geoip-lite"); }
 }
 
+// True for RFC1918 / loopback / link-local / multicast / reserved addresses.
+// Used to keep the all-traffic flow feed focused on external endpoints.
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  if (ip.includes(":")) {
+    const l = ip.toLowerCase();
+    return l === "::1" || l === "::" || l.startsWith("fe80") ||
+           l.startsWith("fc") || l.startsWith("fd") || l.startsWith("ff");
+  }
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some(n => Number.isNaN(n))) return true;
+  const [a, b] = p;
+  return a === 10 || a === 127 || a === 0 ||
+         (a === 172 && b >= 16 && b <= 31) ||
+         (a === 192 && b === 168) ||
+         (a === 169 && b === 254) ||
+         a === 255 || a >= 224;            // broadcast / multicast / reserved
+}
+
 function geoLookup(ip) {
   if (!geoip) return { country: "", city: "", lat: null, lon: null };
   try {
@@ -332,6 +351,29 @@ db.exec(`
     key   TEXT PRIMARY KEY,
     value TEXT
   );
+
+  -- All-traffic connection flows from the Snort extractor (not just rule alerts)
+  CREATE TABLE IF NOT EXISTS flows (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    proto      TEXT,
+    service    TEXT,
+    src_ip     TEXT,
+    dst_ip     TEXT,
+    src_port   INTEGER,
+    dst_port   INTEGER,
+    orig_pkts  INTEGER,
+    resp_pkts  INTEGER,
+    orig_bytes INTEGER,
+    resp_bytes INTEGER,
+    duration   REAL,
+    ext_ip     TEXT,
+    direction  TEXT,
+    country    TEXT,
+    city       TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_flows_ts     ON flows(ts);
+  CREATE INDEX IF NOT EXISTS idx_flows_ext_ip ON flows(ext_ip);
 `);
 
 // Seed default rules if empty
@@ -355,6 +397,11 @@ const insertAlert = db.prepare(`
   VALUES (@ts,@rule,@msg,@category,@severity,@src_ip,@dst_ip,@src_port,@dst_port,@proto,@action,@country,@city,@raw)
 `);
 
+const insertFlow = db.prepare(`
+  INSERT INTO flows (ts,proto,service,src_ip,dst_ip,src_port,dst_port,orig_pkts,resp_pkts,orig_bytes,resp_bytes,duration,ext_ip,direction,country,city)
+  VALUES (@ts,@proto,@service,@src_ip,@dst_ip,@src_port,@dst_port,@orig_pkts,@resp_pkts,@orig_bytes,@resp_bytes,@duration,@ext_ip,@direction,@country,@city)
+`);
+
 // ─── DB retention ────────────────────────────────────────────────────────────
 const MAX_ALERTS = parseInt(process.env.MAX_ALERTS || "500000", 10);
 const pruneStmt  = db.prepare("DELETE FROM alerts WHERE id IN (SELECT id FROM alerts ORDER BY id ASC LIMIT ?)");
@@ -370,9 +417,27 @@ function pruneAlerts() {
   } catch(e) { console.error("[DB] prune error:", e.message); }
 }
 
-// Run prune once on startup + every 6 hours
+// Run prune once on startup + every 60s. Interval-based (not per-insert) so a
+// high alert rate can't saturate the synchronous SQLite/event-loop path.
 pruneAlerts();
-setInterval(pruneAlerts, 6 * 60 * 60 * 1000);
+setInterval(pruneAlerts, 60 * 1000);
+
+// ─── Flow retention (separate, smaller cap — flows are far higher volume) ─────
+const MAX_FLOWS = parseInt(process.env.MAX_FLOWS || "200000", 10);
+// Runtime flow options (persisted in config table). includeInternal=true keeps
+// LAN↔LAN / VLAN↔VLAN flows in the feed (use after a port mirror is in place).
+let flowOptions = dbGet("flow_options", { includeInternal: false });
+const pruneFlowStmt = db.prepare("DELETE FROM flows WHERE id IN (SELECT id FROM flows ORDER BY id ASC LIMIT ?)");
+function pruneFlows() {
+  try {
+    const count = db.prepare("SELECT COUNT(*) as c FROM flows").get().c;
+    if (count > MAX_FLOWS) {
+      pruneFlowStmt.run(count - MAX_FLOWS);
+    }
+  } catch (e) { console.error("[DB] flow prune error:", e.message); }
+}
+pruneFlows();
+setInterval(pruneFlows, 60 * 1000);
 
 function migrateStoredAlerts() {
   const rows = db.prepare("SELECT id, ts, src_ip, country, city FROM alerts ORDER BY id DESC LIMIT 5000").all();
@@ -789,6 +854,127 @@ async function reconcilePreferredBlocklist(blockEntries = []) {
   };
 }
 
+// ─── Proactive DDoS mitigation (rate limits / SYN cookies / invalid-drop) ─────
+// Applied into a DEDICATED nft table `inet snortvision_mit` (OpenWRT) or an
+// iptables chain SNORTVISION_MIT (sensor) so it never touches the router's fw4
+// and can be removed wholesale. All chains use policy ACCEPT and only DROP
+// traffic that EXCEEDS the configured rates, so legitimate traffic passes.
+function clampRate(v, def) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 1000000) : def;
+}
+
+// IMPORTANT: commands are joined with "; " (NOT newlines — newlines get mangled
+// when the script is JSON-stringified through `sh -lc "…"` over SSH). Every nft
+// expression containing shell metacharacters (& | ( ) { }) is single-quoted so
+// the remote shell passes it verbatim to nft.
+function buildMitigationNft(settings) {
+  const rl = settings.rateLimits || {};
+  const syn = clampRate(rl.synFloodRate, 100);
+  const icmp = clampRate(rl.icmpRate, 50);
+  const udp = clampRate(rl.udpRate, 200);
+  const cmds = [
+    'command -v nft >/dev/null 2>&1 || { echo NFT_MISSING; exit 10; }',
+    'nft list table inet snortvision_mit >/dev/null 2>&1 && nft delete table inet snortvision_mit',
+    'nft add table inet snortvision_mit',
+    "nft add chain inet snortvision_mit input '{ type filter hook input priority -5 ; policy accept ; }'",
+    "nft add chain inet snortvision_mit forward '{ type filter hook forward priority -5 ; policy accept ; }'",
+  ];
+  for (const ch of ["input", "forward"]) {
+    if (rl.enabled) {
+      cmds.push(`nft add rule inet snortvision_mit ${ch} 'tcp flags & (fin|syn|rst|ack) == syn limit rate over ${syn}/second drop'`);
+      cmds.push(`nft add rule inet snortvision_mit ${ch} 'meta l4proto { icmp, ipv6-icmp } limit rate over ${icmp}/second drop'`);
+      cmds.push(`nft add rule inet snortvision_mit ${ch} 'meta l4proto udp limit rate over ${udp}/second drop'`);
+    }
+    if (settings.nullRoute) {
+      cmds.push(`nft add rule inet snortvision_mit ${ch} 'ct state invalid drop'`);
+    }
+  }
+  if (settings.synCookie) cmds.push('sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1 || true');
+  cmds.push('printf MIT_READY');
+  return cmds.join(" ; ");
+}
+
+async function applyMitigationToOpenWrt(settings, cfg = getRouterConfig()) {
+  const script = buildMitigationNft(settings);
+  const result = await sshExecCommand(`sh -lc ${JSON.stringify(script)}`, cfg, 25000);
+  const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
+  if (/NFT_MISSING/.test(output)) throw new Error("Router nftables (nft) is unavailable");
+  db.prepare("INSERT INTO iptables_log (op,rule,applied_by) VALUES (?,?,?)").run("MITIGATE", "rate-limit/syn-cookie", "main-router");
+  return { ok: /MIT_READY/.test(output), engine: "router-nft", target: cfg.ip, output };
+}
+
+async function clearMitigationOnOpenWrt(cfg = getRouterConfig()) {
+  const script = [
+    '{ nft list table inet snortvision_mit >/dev/null 2>&1 && nft delete table inet snortvision_mit ; }',
+    'printf MIT_CLEARED',
+  ].join(" ; ");
+  const result = await sshExecCommand(`sh -lc ${JSON.stringify(script)}`, cfg, 20000);
+  db.prepare("INSERT INTO iptables_log (op,rule,applied_by) VALUES (?,?,?)").run("MITIGATE-CLEAR", "all", "main-router");
+  return { ok: true, engine: "router-nft", target: cfg.ip, output: `${result.stdout || ""}${result.stderr || ""}`.trim() };
+}
+
+function buildMitigationIptables(settings, clear = false) {
+  const rl = settings.rateLimits || {};
+  const syn = clampRate(rl.synFloodRate, 100), icmp = clampRate(rl.icmpRate, 50), udp = clampRate(rl.udpRate, 200);
+  const C = [
+    'iptables -F SNORTVISION_MIT 2>/dev/null || iptables -N SNORTVISION_MIT',
+    'iptables -C INPUT -j SNORTVISION_MIT 2>/dev/null || iptables -I INPUT -j SNORTVISION_MIT',
+  ];
+  if (clear) {
+    return [
+      'while iptables -C INPUT -j SNORTVISION_MIT 2>/dev/null; do iptables -D INPUT -j SNORTVISION_MIT; done',
+      'iptables -F SNORTVISION_MIT 2>/dev/null || true',
+      'iptables -X SNORTVISION_MIT 2>/dev/null || true',
+      'printf MIT_CLEARED',
+    ].join(" ; ");
+  }
+  if (rl.enabled) {
+    C.push(`iptables -A SNORTVISION_MIT -p tcp --syn -m limit --limit ${syn}/s --limit-burst ${syn} -j RETURN`);
+    C.push('iptables -A SNORTVISION_MIT -p tcp --syn -j DROP');
+    C.push(`iptables -A SNORTVISION_MIT -p icmp -m limit --limit ${icmp}/s --limit-burst ${icmp} -j RETURN`);
+    C.push('iptables -A SNORTVISION_MIT -p icmp -j DROP');
+    C.push(`iptables -A SNORTVISION_MIT -p udp -m limit --limit ${udp}/s --limit-burst ${udp} -j RETURN`);
+    C.push('iptables -A SNORTVISION_MIT -p udp -j DROP');
+  }
+  if (settings.nullRoute) {
+    C.push('iptables -A SNORTVISION_MIT -m conntrack --ctstate INVALID -j DROP');
+  }
+  if (settings.synCookie) C.push('sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1 || true');
+  C.push('printf MIT_READY');
+  return C.join(" ; ");
+}
+
+async function applyMitigationLocally(settings) {
+  const result = await execLocalCommand(`sh -lc ${JSON.stringify(buildMitigationIptables(settings))}`, 20000);
+  db.prepare("INSERT INTO iptables_log (op,rule,applied_by) VALUES (?,?,?)").run("MITIGATE", "rate-limit/syn-cookie", "sensor-local");
+  return { ok: true, engine: "sensor-local-iptables", target: "sensor", output: result.output || "" };
+}
+
+async function clearMitigationLocally() {
+  const result = await execLocalCommand(`sh -lc ${JSON.stringify(buildMitigationIptables({}, true))}`, 20000).catch(e => ({ output: e.output || e.message || "" }));
+  db.prepare("INSERT INTO iptables_log (op,rule,applied_by) VALUES (?,?,?)").run("MITIGATE-CLEAR", "all", "sensor-local");
+  return { ok: true, engine: "sensor-local-iptables", target: "sensor", output: result.output || "" };
+}
+
+async function applyMitigationToPreferredTarget(settings) {
+  const cfg = getRouterConfig();
+  if (cleanValue(cfg.ip)) {
+    return normalizeRouterType(cfg.routerType) === "OpenWRT"
+      ? applyMitigationToOpenWrt(settings, cfg)
+      : applyMitigationLocally(settings); // generic router: best-effort iptables over SSH not implemented; sensor only
+  }
+  return applyMitigationLocally(settings);
+}
+
+async function clearMitigationOnPreferredTarget() {
+  const cfg = getRouterConfig();
+  if (cleanValue(cfg.ip) && normalizeRouterType(cfg.routerType) === "OpenWRT") {
+    return clearMitigationOnOpenWrt(cfg);
+  }
+  return clearMitigationLocally();
+}
+
 async function gatherOpenWrtRouterInfo(cfg) {
   const monitorExpr = cleanValue(cfg.monitorInterface) || '$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.device" 2>/dev/null)';
 
@@ -1125,26 +1311,36 @@ async function dispatchNotifications(alert) {
 }
 
 // ─── Log tail (local or SSH) ─────────────────────────────────────────────────
-let sshClient  = null;
-let localChild = null;
+// Two independent tails share this machinery: the Snort alert_json log (rule
+// alerts) and the extractor flow log (all-traffic connections). Each keeps its
+// own ssh client / local child in a context holder so they reconnect
+// independently.
+const FLOW_LOG_PATH = process.env.SNORT_FLOW_LOG_PATH || "/var/log/snort/file_connector_sv_flows_transmit";
+const alertTail = { ssh: null, child: null, label: "alert" };
+const flowTail  = { ssh: null, child: null, label: "flow" };
 
-function startTail(onLine) {
+// Back-compat aliases for the alert tail (older code/endpoints reference these)
+function getAlertSsh()   { return alertTail.ssh; }
+function getAlertChild() { return alertTail.child; }
+
+function startTail(onLine, ctx, logPathOverride) {
   const cfg = getConnConfig();
+  const tag = `[${ctx.label}]`;
 
   // ── Local mode: no SSH, tail the file directly on this machine ──
   if (!cfg.ip) {
-    const logPath = cfg.logPath || process.env.SNORT_LOG_PATH || "/var/log/snort/alert_json.txt";
+    const logPath = logPathOverride || cfg.logPath || process.env.SNORT_LOG_PATH || "/var/log/snort/alert_json.txt";
     if (!fs.existsSync(logPath)) {
-      console.log(`[Local] Log file not found: ${logPath} — waiting for it to appear…`);
+      console.log(`${tag} Log file not found: ${logPath} — waiting for it to appear…`);
       // Retry every 10s until file appears
-      setTimeout(() => startTail(onLine), 10000);
+      setTimeout(() => startTail(onLine, ctx, logPathOverride), 10000);
       return;
     }
-    console.log(`[Local] Tailing ${logPath} (no SSH — local mode)`);
-    if (localChild) { try { localChild.kill(); } catch(_){} localChild = null; }
+    console.log(`${tag} Tailing ${logPath} (no SSH — local mode)`);
+    if (ctx.child) { try { ctx.child.kill(); } catch(_){} ctx.child = null; }
 
     const child = spawn("tail", ["-n", "0", "-F", logPath]);
-    localChild = child;
+    ctx.child = child;
     let buf = "";
     child.stdout.on("data", d => {
       buf += d.toString();
@@ -1154,31 +1350,32 @@ function startTail(onLine) {
     });
     child.stderr.on("data", d => {
       const msg = d.toString().trim();
-      if (msg && !msg.includes("file truncated")) console.warn("[Local stderr]", msg);
+      if (msg && !msg.includes("file truncated")) console.warn(`${tag} stderr`, msg);
     });
     child.on("close", code => {
-      console.log(`[Local] tail exited (code ${code}) — restarting in 5s…`);
-      localChild = null;
-      setTimeout(() => startTail(onLine), 5000);
+      console.log(`${tag} tail exited (code ${code}) — restarting in 5s…`);
+      ctx.child = null;
+      setTimeout(() => startTail(onLine, ctx, logPathOverride), 5000);
     });
     child.on("error", err => {
-      console.error("[Local] spawn error:", err.message);
-      setTimeout(() => startTail(onLine), 10000);
+      console.error(`${tag} spawn error:`, err.message);
+      setTimeout(() => startTail(onLine, ctx, logPathOverride), 10000);
     });
     return;
   }
 
   // ── SSH mode: tail via SSH tunnel ──
-  if (sshClient) { try { sshClient.end(); } catch(_){} sshClient = null; }
+  const remotePath = logPathOverride || cfg.logPath;
+  if (ctx.ssh) { try { ctx.ssh.end(); } catch(_){} ctx.ssh = null; }
 
   const ssh = new Client();
-  sshClient = ssh;
+  ctx.ssh = ssh;
 
   let opts;
   try {
     opts = buildSshOptions(cfg);
   } catch (err) {
-    console.warn(`[SSH] ${err.message}`);
+    console.warn(`${tag} ${err.message}`);
     return;
   }
 
@@ -1187,19 +1384,19 @@ function startTail(onLine) {
   function scheduleReconnect(delayMs, reason) {
     if (reconnectScheduled) return;
     reconnectScheduled = true;
-    if (sshClient === ssh) sshClient = null;
+    if (ctx.ssh === ssh) ctx.ssh = null;
     try { ssh.end(); } catch (_) {}
-    console.log(`[SSH] ${reason} — reconnecting in ${delayMs / 1000}s…`);
-    setTimeout(() => startTail(onLine), delayMs);
+    console.log(`${tag} ${reason} — reconnecting in ${delayMs / 1000}s…`);
+    setTimeout(() => startTail(onLine, ctx, logPathOverride), delayMs);
   }
 
   ssh.on("ready", () => {
-    console.log(`[SSH] Connected → ${cfg.ip}  tailing ${cfg.logPath}`);
+    console.log(`${tag} Connected → ${cfg.ip}  tailing ${remotePath}`);
     // Use shell() instead of exec() — shell sessions are persistent and survive
     // server-side exec timeouts that kill long-running exec channels.
     ssh.shell({ term: "dumb", rows: 24, cols: 200 }, (err, stream) => {
       if (err) {
-        console.error("[SSH] shell:", err.message);
+        console.error(`${tag} shell:`, err.message);
         scheduleReconnect(5000, "shell open failed");
         return;
       }
@@ -1217,16 +1414,16 @@ function startTail(onLine) {
       });
       stream.stderr.on("data", d => {
         const msg = d.toString().trim();
-        if (msg && !msg.includes("file truncated")) console.warn("[SSH stderr]", msg);
+        if (msg && !msg.includes("file truncated")) console.warn(`${tag} stderr`, msg);
       });
       stream.on("close", () => scheduleReconnect(5000, "stream closed"));
       // Send the tail command into the shell
-      stream.write(`tail -n 0 -F "${cfg.logPath}"\n`);
+      stream.write(`tail -n 0 -F "${remotePath}"\n`);
     });
   });
 
   ssh.on("error", err => {
-    console.error("[SSH] Error:", err.message);
+    console.error(`${tag} Error:`, err.message);
     scheduleReconnect(10000, `error: ${err.message}`);
   });
 
@@ -1235,6 +1432,21 @@ function startTail(onLine) {
   ssh.on("end",   () => scheduleReconnect(5000, "connection ended"));
 
   ssh.connect(opts);
+}
+
+// Start both tails (alert_json + extractor flow log)
+function startAllTails() {
+  startTail(handleNewAlertLine, alertTail);
+  startTail(handleNewFlowLine,  flowTail, FLOW_LOG_PATH);
+}
+
+// Tear down both tails (used on restart / shutdown)
+function stopAllTails() {
+  for (const ctx of [alertTail, flowTail]) {
+    try { ctx.ssh?.end(); } catch (_) {}
+    try { ctx.child?.kill(); } catch (_) {}
+    ctx.ssh = null; ctx.child = null;
+  }
 }
 
 // ─── Express + WebSocket ─────────────────────────────────────────────────────
@@ -1268,7 +1480,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     app: "SnortVision backend",
-    version: "0.1",
+    version: "0.2",
     message: "Backend is running. This port serves the API, not the frontend UI.",
     endpoints: {
       public_health: "/api/public/health",
@@ -1282,7 +1494,7 @@ app.get("/api/public/health", (req, res) => {
   res.json({
     ok: true,
     app: "SnortVision backend",
-    version: "0.1",
+    version: "0.2",
     auth_required: !!API_KEY,
     timestamp: new Date().toISOString(),
   });
@@ -1304,10 +1516,12 @@ function broadcast(type, data) {
   }
 }
 
-// New WS client → send history
+// New WS client → send history (alerts + recent flows)
 wss.on("connection", ws => {
   const history = db.prepare("SELECT * FROM alerts ORDER BY ts DESC LIMIT 200").all();
   ws.send(JSON.stringify({ type: "history", data: history.reverse() }));
+  const flowHistory = db.prepare("SELECT * FROM flows ORDER BY id DESC LIMIT 300").all();
+  ws.send(JSON.stringify({ type: "flow-history", data: flowHistory.reverse() }));
 });
 
 // ── Health ────────────────────────────────────────────────────────────────────
@@ -1337,7 +1551,7 @@ app.get("/api/health", auth, async (req, res) => {
     mbps: 0,
   }));
 
-  const tailMode = localChild ? "local" : sshClient ? "ssh" : "none";
+  const tailMode = alertTail.child ? "local" : alertTail.ssh ? "ssh" : "none";
   const maskedKey = API_KEY ? API_KEY.slice(0, 6) + "••••••••" + API_KEY.slice(-4) : "(none)";
 
   const cfg = getConnConfig();
@@ -1355,6 +1569,19 @@ app.get("/api/health", auth, async (req, res) => {
     alert_file.error = e.message;
   }
 
+  let flow_file = { path: FLOW_LOG_PATH, exists: false, size: 0, readable: false };
+  try {
+    const stat = fs.statSync(FLOW_LOG_PATH);
+    flow_file.exists = true;
+    flow_file.size = stat.size;
+    flow_file.modified = stat.mtime.toISOString();
+    fs.accessSync(FLOW_LOG_PATH, fs.constants.R_OK);
+    flow_file.readable = true;
+  } catch (e) {
+    flow_file.error = e.message;
+  }
+  const flows_total = db.prepare("SELECT COUNT(*) as c FROM flows").get().c;
+
   const ddos_detected =
     traffic.packet_pps >= DDOS_PACKET_PPS_THRESHOLD ||
     ddos_alerts_10s >= DDOS_ALERT_RATE_THRESHOLD;
@@ -1368,6 +1595,8 @@ app.get("/api/health", auth, async (req, res) => {
     tail_mode: tailMode,
     api_key_masked: maskedKey,
     alert_file,
+    flow_file,
+    flows_total,
     alert_pps,
     packet_pps: traffic.packet_pps,
     rx_pps: traffic.rx_pps,
@@ -1396,6 +1625,57 @@ app.get("/api/alerts", auth, (req, res) => {
   const data  = db.prepare(sql).all(...params).map(enrichAlertGeo);
   const total = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
   res.json({ data, total });
+});
+
+// ── Flows (all-traffic connections from the extractor) ──────────────────────
+app.get("/api/flows", auth, (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit || "200"), 2000);
+  const offset = parseInt(req.query.offset || "0");
+  const dir    = req.query.direction;   // inbound | outbound | external
+  const q      = req.query.q;
+  let sql = "SELECT * FROM flows", params = [], where = [];
+  if (dir && dir !== "all") { where.push("direction = ?"); params.push(dir); }
+  if (q) { where.push("(src_ip LIKE ? OR dst_ip LIKE ? OR service LIKE ? OR country LIKE ?)"); params.push(`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`); }
+  if (where.length) sql += " WHERE " + where.join(" AND ");
+  sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
+  params.push(limit, offset);
+  const data  = db.prepare(sql).all(...params);
+  const total = db.prepare("SELECT COUNT(*) as c FROM flows").get().c;
+  res.json({ data, total });
+});
+
+// Incremental poll — flows newer than the given id (mirrors /api/alerts/new)
+app.get("/api/flows/new", auth, (req, res) => {
+  const since = parseInt(req.query.since) || 0;
+  const flows = db.prepare("SELECT * FROM flows WHERE id > ? ORDER BY id ASC LIMIT 500").all(since);
+  res.json({ flows });
+});
+
+// Flow capture options (include internal LAN/VLAN traffic in the feed)
+app.get("/api/flows/options", auth, (req, res) => res.json(flowOptions));
+app.post("/api/flows/options", auth, (req, res) => {
+  flowOptions = { includeInternal: !!req.body?.includeInternal };
+  dbSet("flow_options", flowOptions);
+  res.json({ ok: true, ...flowOptions });
+});
+
+// Aggregates for the map / dashboard (top talkers, countries, protocols)
+app.get("/api/flows/stats", auth, (req, res) => {
+  const mins = Math.min(parseInt(req.query.minutes || "60"), 1440);
+  const since = `datetime('now','-${mins} minutes')`;
+  const topTalkers = db.prepare(
+    `SELECT ext_ip, country, COUNT(*) c, SUM(orig_bytes+resp_bytes) bytes
+     FROM flows WHERE ts > ${since} GROUP BY ext_ip ORDER BY c DESC LIMIT 20`).all();
+  const topCountries = db.prepare(
+    `SELECT country, COUNT(*) c FROM flows WHERE ts > ${since} AND country != ''
+     GROUP BY country ORDER BY c DESC LIMIT 15`).all();
+  const protocols = db.prepare(
+    `SELECT COALESCE(NULLIF(service,''), proto) AS name, COUNT(*) c
+     FROM flows WHERE ts > ${since} GROUP BY name ORDER BY c DESC LIMIT 12`).all();
+  const byDirection = db.prepare(
+    `SELECT direction, COUNT(*) c FROM flows WHERE ts > ${since} GROUP BY direction`).all();
+  const total = db.prepare(`SELECT COUNT(*) c FROM flows WHERE ts > ${since}`).get().c;
+  res.json({ minutes: mins, total, topTalkers, topCountries, protocols, byDirection });
 });
 
 // New alerts since id — used by frontend polling
@@ -1556,6 +1836,143 @@ app.post("/api/router/reconcile", auth, async (req, res) => {
     res.json({ ok: result.ok, synced: active.length, applied: result.applied, failed: result.failed, target: result.target, results: result.results });
   } catch (err) {
     res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// ─── Router mirror: probe capabilities so we generate the right commands ─────
+app.get("/api/router/mirror/probe", auth, async (req, res) => {
+  const cfg = getRouterConfig();
+  if (!cleanValue(cfg.ip)) return res.status(400).json({ ok: false, message: "Main router not configured" });
+  // NOTE: no $ / $(...) — the script is wrapped in double quotes through `sh -lc`,
+  // so shell variables would expand at the wrong layer. Keep commands literal.
+  const probe = [
+    'echo ==MODEL==', 'ubus call system board 2>/dev/null | grep -E "model|release" || cat /tmp/sysinfo/model 2>/dev/null',
+    'echo ==IFACES==', 'ls -1 /sys/class/net 2>/dev/null | tr "\\n" " "', 'echo',
+    'echo ==BRIDGES==', 'ls -d /sys/class/net/*/bridge 2>/dev/null || echo none',
+    'echo ==BRVLAN==', 'bridge vlan show 2>/dev/null | head -50 || echo none',
+    'echo ==DSA==', 'ls -d /sys/class/net/*/dsa 2>/dev/null || echo none',
+    'echo ==SWCONFIG==', 'swconfig list 2>/dev/null || echo none',
+    'echo ==TC==', 'tc -V 2>/dev/null || echo none',
+    'echo ==NFT==', 'nft --version 2>/dev/null || echo none',
+    'echo ==MODLOADED==', 'lsmod 2>/dev/null | grep -E "mirred|cls_act|sch_ingress|gretap|^gre " || echo none-loaded',
+    'echo ==MODAVAIL==', 'find /lib/modules -name "act_mirred.ko*" -o -name "cls_*.ko*" -o -name "sch_ingress.ko*" -o -name "gre.ko*" -o -name "*gretap*" 2>/dev/null || echo none',
+    'echo ==WAN==', 'ubus call network.interface.wan status 2>/dev/null | grep -E "\\"device\\"|l3_device" | head -2 || echo none',
+    'echo ==END==',
+  ].join(" ; ");
+  try {
+    const r = await sshExecCommand(`sh -lc ${JSON.stringify(probe)}`, cfg, 25000);
+    const output = `${r.stdout || ""}${r.stderr || ""}`.trim();
+    res.json({ ok: true, target: cfg.ip, output });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+// ─── Router traffic mirror (GRETAP + tc mirred → sensor) ─────────────────────
+const SAFE_BR = /^br-[a-z0-9_-]+$/i;
+function buildMirrorApply(bridges, routerIp, sensorIp) {
+  const cmds = [
+    `ip link show svmirror >/dev/null 2>&1 || ip link add svmirror type gretap local ${routerIp} remote ${sensorIp} ttl 64`,
+    'ip link set svmirror up',
+  ];
+  for (const br of bridges) {
+    cmds.push(`tc qdisc del dev ${br} clsact 2>/dev/null || true`);
+    cmds.push(`tc qdisc add dev ${br} clsact`);
+    // Loop guard: never mirror the GRE tunnel itself (IP proto 47)
+    cmds.push(`tc filter add dev ${br} ingress pref 1 protocol ip u32 match ip protocol 47 0xff action pass`);
+    cmds.push(`tc filter add dev ${br} ingress pref 2 matchall action mirred egress mirror dev svmirror`);
+    cmds.push(`tc filter add dev ${br} egress pref 1 protocol ip u32 match ip protocol 47 0xff action pass`);
+    cmds.push(`tc filter add dev ${br} egress pref 2 matchall action mirred egress mirror dev svmirror`);
+  }
+  cmds.push('printf MIRROR_READY');
+  return cmds.join(" ; ");
+}
+function buildMirrorRemove(bridges) {
+  const cmds = [];
+  for (const br of bridges) cmds.push(`tc qdisc del dev ${br} clsact 2>/dev/null || true`);
+  cmds.push('ip link del svmirror 2>/dev/null || true');
+  cmds.push('printf MIRROR_CLEARED');
+  return cmds.join(" ; ");
+}
+
+app.post("/api/router/mirror/apply", auth, async (req, res) => {
+  const cfg = getRouterConfig();
+  if (!cleanValue(cfg.ip)) return res.status(400).json({ ok:false, message:"Main router not configured" });
+  const bridges = (req.body?.bridges || []).filter(b => SAFE_BR.test(b));
+  if (!bridges.length) return res.status(400).json({ ok:false, message:"No valid bridge(s) given" });
+  const sensorIp = classifyNetworkTarget(req.body?.sensorIp || "").ok ? req.body.sensorIp : "";
+  if (!sensorIp) return res.status(400).json({ ok:false, message:"Valid sensorIp required" });
+  try {
+    const r = await sshExecCommand(`sh -lc ${JSON.stringify(buildMirrorApply(bridges, cfg.ip, sensorIp))}`, cfg, 30000);
+    const output = `${r.stdout || ""}${r.stderr || ""}`.trim();
+    db.prepare("INSERT INTO iptables_log (op,rule,applied_by) VALUES (?,?,?)").run("MIRROR", bridges.join(","), "main-router");
+    res.json({ ok:/MIRROR_READY/.test(output), bridges, sensorIp, output });
+  } catch (err) { res.status(500).json({ ok:false, message:err.message }); }
+});
+
+app.post("/api/router/mirror/remove", auth, async (req, res) => {
+  const cfg = getRouterConfig();
+  if (!cleanValue(cfg.ip)) return res.status(400).json({ ok:false, message:"Main router not configured" });
+  const bridges = (req.body?.bridges || ["br-lan","br-company","br-eva","br-iot","br-paineis"]).filter(b => SAFE_BR.test(b));
+  try {
+    const r = await sshExecCommand(`sh -lc ${JSON.stringify(buildMirrorRemove(bridges))}`, cfg, 25000);
+    db.prepare("INSERT INTO iptables_log (op,rule,applied_by) VALUES (?,?,?)").run("MIRROR-REMOVE", bridges.join(","), "main-router");
+    res.json({ ok:true, output:`${r.stdout || ""}${r.stderr || ""}`.trim() });
+  } catch (err) { res.status(500).json({ ok:false, message:err.message }); }
+});
+
+app.get("/api/router/mirror/status", auth, async (req, res) => {
+  const cfg = getRouterConfig();
+  if (!cleanValue(cfg.ip)) return res.json({ ok:false, active:false, message:"router not configured" });
+  try {
+    const probe = ['ip -br link show svmirror 2>/dev/null || echo NONE', 'echo ==FILTERS==', 'tc -s qdisc show 2>/dev/null | grep -A0 clsact || echo none'].join(" ; ");
+    const r = await sshExecCommand(`sh -lc ${JSON.stringify(probe)}`, cfg, 15000);
+    const output = `${r.stdout || ""}${r.stderr || ""}`.trim();
+    res.json({ ok:true, active:/svmirror/.test(output) && !/NONE/.test(output.split("==FILTERS==")[0]||""), output });
+  } catch (err) { res.json({ ok:false, active:false, message:err.message }); }
+});
+
+// ─── Proactive mitigation enforcement (rate limits / SYN cookies / invalid) ──
+app.post("/api/mitigation/apply", auth, async (req, res) => {
+  const settings = {
+    rateLimits: req.body?.rateLimits || {},
+    synCookie:  !!req.body?.synCookie,
+    nullRoute:  !!req.body?.nullRoute,
+  };
+  try {
+    const result = await applyMitigationToPreferredTarget(settings);
+    res.json({ ok: result.ok !== false, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.post("/api/mitigation/clear", auth, async (req, res) => {
+  try {
+    const result = await clearMitigationOnPreferredTarget();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err.message });
+  }
+});
+
+app.get("/api/mitigation/status", auth, async (req, res) => {
+  const cfg = getRouterConfig();
+  const onRouter = cleanValue(cfg.ip) && normalizeRouterType(cfg.routerType) === "OpenWRT";
+  try {
+    let active = false, output = "", engine = onRouter ? "router-nft" : "sensor-local-iptables", target = onRouter ? cfg.ip : "sensor";
+    if (onRouter) {
+      const r = await sshExecCommand(`sh -lc ${JSON.stringify('nft list table inet snortvision_mit 2>/dev/null || echo NONE')}`, cfg, 12000);
+      output = `${r.stdout || ""}${r.stderr || ""}`.trim();
+      active = !/NONE/.test(output) && /snortvision_mit/.test(output);
+    } else {
+      const r = await execLocalCommand('iptables -S SNORTVISION_MIT 2>/dev/null || echo NONE', 8000).catch(() => ({ output: "NONE" }));
+      output = r.output || "";
+      active = !/NONE/.test(output) && /SNORTVISION_MIT/.test(output);
+    }
+    res.json({ ok: true, active, engine, target, output });
+  } catch (err) {
+    res.json({ ok: false, active: false, message: err.message });
   }
 });
 
@@ -1986,8 +2403,8 @@ app.post("/api/config/connection", auth, (req, res) => {
 
   // If no IP, switch to local tail mode
   if (!cfg.ip) {
-    if (sshClient) { try { sshClient.end(); } catch(_){} sshClient = null; }
-    setTimeout(() => startTail(handleNewAlertLine), 500);
+    stopAllTails();
+    setTimeout(startAllTails, 500);
     return res.json({ ok: true, message: "Local mode — tailing log file directly" });
   }
 
@@ -2004,8 +2421,9 @@ app.post("/api/config/connection", auth, (req, res) => {
   testSsh
     .on("ready", () => {
       testSsh.end();
-      // Restart tail with new config
-      setTimeout(() => startTail(handleNewAlertLine), 500);
+      // Restart tails with new config
+      stopAllTails();
+      setTimeout(startAllTails, 500);
       res.json({ ok: true, message: `Connected to ${cfg.ip}` });
     })
     .on("error", e => res.json({ ok: false, message: e.message }))
@@ -2324,7 +2742,7 @@ app.get("/api/services/status", auth, async (req, res) => {
   }
 
   checks.backend = "running";
-  checks.tail_mode = localChild ? "local" : sshClient ? "ssh" : "none";
+  checks.tail_mode = alertTail.child ? "local" : alertTail.ssh ? "ssh" : "none";
   checks.uptime = Math.round(process.uptime());
   checks.pid = process.pid;
   checks.env_file = ENV_PATH;
@@ -2428,17 +2846,16 @@ app.post("/api/services/restart/backend", auth, (req, res) => {
   res.json({ ok: true, message: "Backend restarting in 2 seconds…" });
   console.log("[Services] Backend restart requested — exiting in 2s (Docker/systemd will restart)");
   setTimeout(() => {
-    try { sshClient?.end(); localChild?.kill(); } catch(_){}
+    stopAllTails();
     process.exit(0); // Docker restart policy or systemd will bring it back
   }, 2000);
 });
 
 app.post("/api/services/restart/tail", auth, (req, res) => {
-  console.log("[Services] Restarting log tail…");
-  if (localChild) { try { localChild.kill(); } catch(_){} localChild = null; }
-  if (sshClient) { try { sshClient.end(); } catch(_){} sshClient = null; }
-  setTimeout(() => startTail(handleNewAlertLine), 500);
-  res.json({ ok: true, message: "Log tail restarted" });
+  console.log("[Services] Restarting log tails…");
+  stopAllTails();
+  setTimeout(startAllTails, 500);
+  res.json({ ok: true, message: "Log tails restarted" });
 });
 
 // ─── Handle new alert from SSH tail ──────────────────────────────────────────
@@ -2453,12 +2870,81 @@ function handleNewAlertLine(line) {
 
   broadcast("alert", alert);
   dispatchNotifications(alert).catch(e => console.error("[Notify]", e.message));
+  // NOTE: pruning is handled by a periodic timer (see pruneAlerts interval),
+  // NOT per-insert. A full COUNT(*) on every alert melts the event loop at the
+  // high alert rates Snort can produce (thousands/sec).
+}
 
-  // Non-blocking prune — runs asap after insert but doesn't block the alert pipeline
-  setImmediate(()=>{
-    const count = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
-    if (count > MAX_ALERTS) pruneAlerts();
-  });
+// ─── Handle a new connection flow from the Snort extractor log ───────────────
+// Parses one JSON 'conn' event (Zeek-style id.orig_h / id.resp_h fields),
+// keeps only flows that touch an external IP, geo-locates the external end,
+// and rate-samples to protect the DB and the browser during bursts.
+function parseFlowLine(line) {
+  try {
+    const j = JSON.parse(line.trim());
+    const src_ip = j["id.orig_h"];
+    const dst_ip = j["id.resp_h"];
+    if (!src_ip || !dst_ip) return null;
+
+    const srcPriv = isPrivateIp(src_ip);
+    const dstPriv = isPrivateIp(dst_ip);
+    const internal = srcPriv && dstPriv;
+    // LAN↔LAN (incl. VLAN↔VLAN) is only kept when the operator opts in (e.g.
+    // after setting up a port mirror); otherwise the feed stays external-only.
+    if (internal && !flowOptions.includeInternal) return null;
+
+    const ext_ip    = internal ? "" : (srcPriv ? dst_ip : src_ip);
+    const direction = internal ? "internal"
+                    : srcPriv && !dstPriv ? "outbound"
+                    : !srcPriv && dstPriv ? "inbound"
+                    : "external";
+    const geo = ext_ip ? geoLookup(ext_ip) : { country: "", city: "" };
+
+    // extractor ts is unix microseconds
+    const tsMs = j.ts ? Math.round(Number(j.ts) / 1000) : Date.now();
+
+    return {
+      ts:         new Date(tsMs).toISOString(),
+      proto:      String(j.proto || "").toUpperCase(),
+      service:    j.service || "",
+      src_ip, dst_ip,
+      src_port:   Number(j["id.orig_p"]) || 0,
+      dst_port:   Number(j["id.resp_p"]) || 0,
+      orig_pkts:  Number(j.orig_pkts)  || 0,
+      resp_pkts:  Number(j.resp_pkts)  || 0,
+      orig_bytes: Number(j.orig_bytes) || 0,
+      resp_bytes: Number(j.resp_bytes) || 0,
+      duration:   Number(j.duration)   || 0,
+      ext_ip, direction,
+      country:    geo.country || "",
+      city:       geo.city    || "",
+    };
+  } catch { return null; }
+}
+
+// Per-second rate sampler: keep everything up to the cap, then thin bursts.
+const FLOW_MAX_PER_SEC = parseInt(process.env.FLOW_MAX_PER_SEC || "40", 10);
+let flowWindowSec = 0, flowWindowCount = 0;
+function flowSampleAllow() {
+  const sec = Math.floor(Date.now() / 1000);
+  if (sec !== flowWindowSec) { flowWindowSec = sec; flowWindowCount = 0; }
+  flowWindowCount++;
+  if (flowWindowCount <= FLOW_MAX_PER_SEC) return true;
+  return (flowWindowCount % 5) === 0;             // beyond cap: keep ~1 in 5
+}
+
+function handleNewFlowLine(line) {
+  const flow = parseFlowLine(line);
+  if (!flow) return;
+  if (!flowSampleAllow()) return;
+
+  try {
+    const result = insertFlow.run(flow);
+    flow.id = result.lastInsertRowid;
+  } catch (e) { console.error("[DB flow]", e.message); return; }
+
+  broadcast("flow", flow);
+  // Pruning handled by the periodic pruneFlows timer (not per-insert).
 }
 
 // ─── DB management endpoints ─────────────────────────────────────────────────
@@ -2470,6 +2956,75 @@ app.get("/api/db/stats", auth, (req, res) => {
   const configRows  = db.prepare("SELECT COUNT(*) as c FROM config").get().c;
   const blocklistRows = db.prepare("SELECT COUNT(*) as c FROM blocklist").get().c;
   res.json({ count, oldest: oldest?.ts || null, newest: newest?.ts || null, dbSizeBytes, maxAlerts: MAX_ALERTS, configRows, blocklistRows });
+});
+
+// ─── Generic DB browser API (powers the standalone /db viewer) ───────────────
+// Tables are whitelisted, so the table name can be safely interpolated into SQL.
+// Sort columns are validated against the real schema; all values are bound.
+const DB_TABLES = {
+  alerts:       { pk: "id",  label: "Alerts" },
+  flows:        { pk: "id",  label: "Flows (all traffic)" },
+  blocklist:    { pk: "id",  label: "Blocklist" },
+  rules:        { pk: "id",  label: "Rules" },
+  iptables_log: { pk: "id",  label: "iptables log" },
+  config:       { pk: "key", label: "Config" },
+};
+function tableColumns(name) {
+  return db.prepare(`PRAGMA table_info(${name})`).all().map(c => c.name);
+}
+
+app.get("/api/db/tables", auth, (req, res) => {
+  const tables = Object.entries(DB_TABLES).map(([name, meta]) => {
+    let rows = 0;
+    try { rows = db.prepare(`SELECT COUNT(*) c FROM ${name}`).get().c; } catch {}
+    return { name, label: meta.label, pk: meta.pk, columns: tableColumns(name), rows };
+  });
+  const dbSizeBytes = (() => { try { return fs.statSync(DB_PATH).size; } catch { return 0; } })();
+  res.json({ tables, dbSizeBytes });
+});
+
+app.get("/api/db/table/:name", auth, (req, res) => {
+  const meta = DB_TABLES[req.params.name];
+  if (!meta) return res.status(404).json({ error: "unknown table" });
+  const name = req.params.name;
+  const cols = tableColumns(name);
+  const limit  = Math.min(parseInt(req.query.limit  || "50"), 500);
+  const offset = Math.max(parseInt(req.query.offset || "0"), 0);
+  const sort   = cols.includes(req.query.sort) ? req.query.sort : meta.pk;
+  const dir    = String(req.query.dir || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+  const q      = req.query.q;
+
+  let where = "", params = [];
+  if (q) {
+    where = " WHERE " + cols.map(c => `CAST("${c}" AS TEXT) LIKE ?`).join(" OR ");
+    params = cols.map(() => `%${q}%`);
+  }
+  const total = db.prepare(`SELECT COUNT(*) c FROM ${name}${where}`).get(...params).c;
+  const rows  = db.prepare(`SELECT * FROM ${name}${where} ORDER BY "${sort}" ${dir} LIMIT ? OFFSET ?`).all(...params, limit, offset);
+  res.json({ name, label: meta.label, pk: meta.pk, columns: cols, rows, total, limit, offset, sort, dir: dir.toLowerCase(), q: q || "" });
+});
+
+app.delete("/api/db/table/:name/row/:id", auth, (req, res) => {
+  const meta = DB_TABLES[req.params.name];
+  if (!meta) return res.status(404).json({ error: "unknown table" });
+  const r = db.prepare(`DELETE FROM ${req.params.name} WHERE "${meta.pk}" = ?`).run(req.params.id);
+  res.json({ ok: true, deleted: r.changes });
+});
+
+app.delete("/api/db/table/:name", auth, (req, res) => {
+  const meta = DB_TABLES[req.params.name];
+  if (!meta) return res.status(404).json({ error: "unknown table" });
+  const r = db.prepare(`DELETE FROM ${req.params.name}`).run();
+  try { db.prepare("VACUUM").run(); } catch {}
+  res.json({ ok: true, deleted: r.changes });
+});
+
+// Standalone HTML DB viewer (served at /db; nginx routes /db → backend)
+const DB_VIEWER_HTML = path.join(__dirname, "dbviewer.html");
+app.get("/db", (req, res) => {
+  res.sendFile(DB_VIEWER_HTML, err => {
+    if (err) res.status(500).send("DB viewer not available");
+  });
 });
 
 // DELETE /api/alerts?days=30  — delete older than N days
@@ -2598,7 +3153,7 @@ app.get("/api/public/client-config", (req, res) => {
   res.json({
     backendUrl:   process.env.BACKEND_URL || "",
     requiresAuth: !!(API_KEY),
-    version:      "0.1",
+    version:      "0.2",
   });
 });
 
@@ -2611,14 +3166,14 @@ if (HAS_FRONTEND_DIST) {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log("┌───────────────────────────────────────────────────┐");
-  console.log("│  SnortVision Backend v0.1                         │");
+  console.log("│  SnortVision Backend v0.2                         │");
   console.log(`│  API  : http://0.0.0.0:${PORT}                       │`);
   console.log(`│  WS   : ws://0.0.0.0:${PORT}/ws                    │`);
   console.log(`│  DB   : ${DB_PATH}`);
   console.log(`│  KEY  : ${API_KEY.slice(0,6)}••••${API_KEY.slice(-4)}  (see .env for full key)  │`);
   console.log("└───────────────────────────────────────────────────┘");
-  startTail(handleNewAlertLine);
+  startAllTails();
 });
 
-process.on("SIGTERM", () => { try { sshClient?.end(); localChild?.kill(); } catch(_){} server.close(); });
-process.on("SIGINT",  () => { try { sshClient?.end(); localChild?.kill(); } catch(_){} server.close(); process.exit(0); });
+process.on("SIGTERM", () => { stopAllTails(); server.close(); });
+process.on("SIGINT",  () => { stopAllTails(); server.close(); process.exit(0); });
