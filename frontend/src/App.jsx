@@ -8,7 +8,7 @@ import {
   ChevronUp, ChevronDown, Globe, Lock, Unlock, Eye, EyeOff,
   Clock, Hash, Layers, Play, Pause, Save, RotateCcw, Copy,
   ArrowUp, ArrowDown, Minus, Link2, Unlink, Server,
-  User, Key, CheckCircle2, XCircle, Loader2, Download, HardDrive, Radio, Sun, Moon
+  User, Key, CheckCircle2, XCircle, Loader2, Download, HardDrive, Radio, Sun, Moon, Crosshair
 } from "lucide-react";
 
 // ─── Sim data ────────────────────────────────────────────────────────────────
@@ -263,13 +263,30 @@ async function _resolveGeo3d(ips, backendUrl) {
     }
   }
 }
+// External end of an alert: the public address on either side (null when both are internal).
+function _extOf(a) {
+  const pub = ip => ip && ip !== "0.0.0.0" && !_isPrivate3d(ip);
+  return pub(a.src_ip) ? a.src_ip : pub(a.dst_ip) ? a.dst_ip : null;
+}
 function _isPrivate3d(ip) {
   if (!ip) return true;
   const p = ip.split(".").map(Number);
   return p.length < 4 || p[0] === 10 || p[0] === 127 || p[0] === 0 ||
     (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
-    (p[0] === 192 && p[1] === 168) || (p[0] === 169 && p[1] === 254);
+    (p[0] === 192 && p[1] === 168) || (p[0] === 169 && p[1] === 254) ||
+    (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||   // CGNAT
+    p[0] >= 224;                                       // multicast, reserved, broadcast
 }
+
+// Full country name from ISO code ("SG" → "Singapore"); falls back to the code.
+const _regionNames = (() => { try { return new Intl.DisplayNames(["en"], { type: "region" }); } catch { return null; } })();
+function countryName(cc, fallback = "") {
+  if (cc && /^[A-Z]{2}$/.test(cc)) { try { return _regionNames?.of(cc) || cc; } catch { return cc; } }
+  return fallback || cc || "";
+}
+// Canvas height follows the card width (wide screens get a taller stage, phones a shorter one).
+const globeHeight = w => Math.round(Math.max(360, Math.min(560, w * 0.48)));
+const _reduceMotion = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 // ─── 3D Cyberthreat Globe (Kaspersky-style) ───────────────────────────────────
 function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShowAllTraffic = ()=>{} }) {
@@ -279,6 +296,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     arcs:[], flowArcs:[], markers:{}, rings:[], frame:null,
     t:0, dragging:false, lastMouse:{x:0,y:0},
     vel:{x:0,y:0}, autoRot:false, autoTimer:null, ready:false,  // autoRot permanently off
+    homeView:{x:0,y:0}, tween:null,
   });
   const [geoV, setGeoV] = useState(0);
 
@@ -295,6 +313,35 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     );
   }
 
+  // Arc between two surface points; the further apart, the higher it rises, so short
+  // European hops stay low and transatlantic arcs clear the limb without leaving the frame.
+  function arcCurve(a, b) {
+    const THREE = window.THREE;
+    const ang = a.angleTo(b);                          // 0..PI
+    const lift = GR * (1.04 + 0.42 * (ang / Math.PI));
+    const mid = new THREE.Vector3().addVectors(a, b);
+    if (mid.lengthSq() < 1e-6) mid.set(0, 1, 0);       // antipodal guard
+    return new THREE.QuadraticBezierCurve3(a, mid.normalize().multiplyScalar(lift * 1.06), b);
+  }
+
+  // Rotation that puts home facing the camera, a little above centre so arcs from
+  // the Americas and Asia (below/left/right of Europe on the sphere) stay in view.
+  function viewToward(lat, lon) {
+    const h = ll(lat, lon, 1);
+    const y = Math.atan2(-h.x, h.z);
+    const zAfter = Math.hypot(h.x, h.z);
+    return { x: Math.atan2(h.y, zAfter) * 0.78, y };
+  }
+  function recentre() {
+    const s = S.current;
+    if (!s.globe) return;
+    s.vel = { x: 0, y: 0 };
+    const from = { x: s.globe.rotation.x, y: s.globe.rotation.y };
+    // take the short way round
+    let dy = s.homeView.y - from.y; dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+    s.tween = { from, to: { x: s.homeView.x, y: from.y + dy }, t0: s.t, dur: _reduceMotion ? 0.01 : 0.9 };
+  }
+
   // ── Init Three.js scene ──────────────────────────────────────────────────────
   useEffect(() => {
     ensureThree(() => {
@@ -302,12 +349,13 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       if (s.ready || !mountRef.current) return;
       s.ready = true;
       const THREE = window.THREE;
-      const W = mountRef.current.clientWidth, H = 520;
+      const W = mountRef.current.clientWidth, H = globeHeight(W);
+      mountRef.current.style.height = H + "px";
 
       // Core
       s.scene  = new THREE.Scene();
       s.camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 200);
-      s.camera.position.z = 5.2;  // slightly closer for more globe presence
+      s.camera.position.z = 6.4;  // whole globe + atmosphere inside the frame
       s.renderer = new THREE.WebGLRenderer({ antialias: true });
       s.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
       s.renderer.setSize(W, H);
@@ -343,8 +391,9 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       // To face lon=6° → rotation.y ≈ -(6°)*PI/180 adjusted for texture orientation
       // Rotation to face Luxembourg (lon=6.13°E) toward camera (+z axis)
       // Formula: rot.y = -(th_LU - PI/2), where th_LU = (6.13+180)*PI/180 = 3.249
-      s.globe.rotation.y = -1.68;   // places Europe/LU facing camera
-      s.globe.rotation.x =  0.18;   // tilt to show northern hemisphere nicely
+      s.homeView = viewToward(HOME[0], HOME[1]);
+      s.globe.rotation.y = s.homeView.y;
+      s.globe.rotation.x = s.homeView.x;
       s.scene.add(s.globe);
 
       // Base sphere
@@ -418,9 +467,15 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
 
         // Rotation
         // Auto-rotation disabled — globe only moves on drag
-        if (!s.dragging) {
+        if (s.tween) {
+          const k = Math.min(1, (s.t - s.tween.t0) / s.tween.dur);
+          const e = 1 - Math.pow(1 - k, 3);
+          s.globe.rotation.x = s.tween.from.x + (s.tween.to.x - s.tween.from.x) * e;
+          s.globe.rotation.y = s.tween.from.y + (s.tween.to.y - s.tween.from.y) * e;
+          if (k >= 1) s.tween = null;
+        } else if (!s.dragging) {
           s.globe.rotation.y += s.vel.y;
-          s.globe.rotation.x = Math.max(-0.65, Math.min(0.65, s.globe.rotation.x + s.vel.x));
+          s.globe.rotation.x = Math.max(-1.2, Math.min(1.2, s.globe.rotation.x + s.vel.x));
           s.vel.x *= 0.92; s.vel.y *= 0.92;
         }
 
@@ -447,7 +502,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           const ps = 0.7 + 0.5 * Math.sin(s.t * 10 + arc.phase);
           arc.dot.scale.setScalar(ps);
           // Impact pulse at home when arc first arrives
-          if (arc.t >= 1 && !arc.pulsed) {
+          if (arc.t >= 1 && !arc.pulsed && arc.inbound && !_reduceMotion) {
             arc.pulsed = true;
             // Spawn a brief impact ring
             for (let ri = 0; ri < 2; ri++) {
@@ -502,6 +557,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       // ── Drag to rotate ──
       const el = s.renderer.domElement;
       const dn = e => {
+        s.tween = null;
         s.dragging = true;
         s.lastMouse = { x: e.clientX, y: e.clientY };
         el.style.cursor = "grabbing";
@@ -510,7 +566,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         if (!s.dragging) return;
         const dx = e.clientX - s.lastMouse.x, dy = e.clientY - s.lastMouse.y;
         s.globe.rotation.y += dx * 0.004;
-        s.globe.rotation.x = Math.max(-0.65, Math.min(0.65, s.globe.rotation.x + dy * 0.004));
+        s.globe.rotation.x = Math.max(-1.2, Math.min(1.2, s.globe.rotation.x + dy * 0.004));
         s.vel = { x: dy * 0.002, y: dx * 0.002 };
         s.lastMouse = { x: e.clientX, y: e.clientY };
       };
@@ -519,22 +575,25 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         // No auto-rotate resume — globe stays where user leaves it
       };
       el.addEventListener("mousedown", dn);
+      el.addEventListener("dblclick", recentre);
       window.addEventListener("mousemove", mv);
       window.addEventListener("mouseup", up);
 
       // Resize
       const onResize = () => {
         if (!mountRef.current) return;
-        const w = mountRef.current.clientWidth;
-        s.camera.aspect = w / 520;
+        const w = mountRef.current.clientWidth, h = globeHeight(w);
+        mountRef.current.style.height = h + "px";
+        s.camera.aspect = w / h;
         s.camera.updateProjectionMatrix();
-        s.renderer.setSize(w, 520);
+        s.renderer.setSize(w, h);
       };
       window.addEventListener("resize", onResize);
 
       s._cleanup = () => {
         cancelAnimationFrame(s.frame);
         el.removeEventListener("mousedown", dn);
+        el.removeEventListener("dblclick", recentre);
         window.removeEventListener("mousemove", mv);
         window.removeEventListener("mouseup", up);
         window.removeEventListener("resize", onResize);
@@ -548,33 +607,36 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
 
   // ── Resolve GeoIPs ────────────────────────────────────────────────────────────
   useEffect(() => {
-    const ips = [...new Set(alerts.filter(a => !_isPrivate3d(a.src_ip)).map(a => a.src_ip).filter(Boolean))];
+    const ips = [...new Set(alerts.map(_extOf).filter(Boolean))];
     const unknown = ips.filter(ip => !_geo3d[ip]);
     if (unknown.length) _resolveGeo3d(unknown, backendUrl).then(ok => { if (ok) setGeoV(v => v + 1); });
-  }, [alerts.length]);
+  }, [alerts.length, alerts[0]?.id]);
 
   // ── Add arcs for new alerts ───────────────────────────────────────────────────
   useEffect(() => {
     const s = S.current;
     if (!s.ready || !s.globe || !window.THREE) return;
     const THREE = window.THREE;
-    const SEV_HEX = { critical: 0xff2d55, high: 0xff9f0a, medium: 0xffd60a, low: 0x30d158, info: 0x0a84ff };
+    const SEV_HEX = { critical: 0xff2d55, high: 0xff9f0a, medium: 0xffd60a, low: 0x64d2ff, info: 0x0a84ff };
 
-    alerts.filter(a => !_isPrivate3d(a.src_ip) && a.src_ip !== "0.0.0.0").slice(0, 80).forEach((alert, idx) => {
+    alerts.filter(a => _extOf(a)).slice(0, 80).forEach((alert, idx) => {
       const arcId = alert.id != null ? alert.id : idx;
       if (s.arcs.find(a => a.id === arcId)) return;
 
+      // The external end of the alert: attacker for inbound, destination (e.g. C2) for outbound.
+      const ext = _extOf(alert);
+      const inbound = ext === alert.src_ip;
       // Priority: 1) ip-api exact coords  2) country centroid  3) skip
-      const geo = _geo3d[alert.src_ip];
-      const ccCoord = COUNTRY_COORDS[alert.country] || COUNTRY_COORDS[_geo3d[alert.src_ip]?.cc];
+      const geo = _geo3d[ext];
+      const ccCoord = COUNTRY_COORDS[inbound ? alert.country : ""] || COUNTRY_COORDS[geo?.cc];
       const src = geo ? [geo.lat, geo.lon] : ccCoord;
       if (!src) return;  // no coords yet — will appear after geo resolves
 
-      const from = ll(src[0], src[1], GR + 0.01);
-      const to   = ll(HOME[0], HOME[1], GR + 0.01);
-      const mid  = new THREE.Vector3().addVectors(from, to).normalize()
-        .multiplyScalar(GR * (1.3 + Math.random() * 0.6));
-      const curve = new THREE.QuadraticBezierCurve3(from, mid, to);
+      const extPos  = ll(src[0], src[1], GR + 0.01);
+      const homePos = ll(HOME[0], HOME[1], GR + 0.01);
+      const from = inbound ? extPos : homePos;
+      const to   = inbound ? homePos : extPos;
+      const curve = arcCurve(from, to);
       const col = SEV_HEX[alert.severity] || SEV_HEX.info;
 
       // Arc line
@@ -594,18 +656,18 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       s.globe.add(dot);
 
       // Origin dot marker
-      if (!s.markers[alert.src_ip]) {
+      if (!s.markers[ext]) {
         const mk = new THREE.Mesh(
           new THREE.SphereGeometry(0.024, 8, 8),
           new THREE.MeshBasicMaterial({ color: col, blending: THREE.AdditiveBlending })
         );
         mk.position.copy(ll(src[0], src[1], GR + 0.016));
         s.globe.add(mk);
-        s.markers[alert.src_ip] = mk;
+        s.markers[ext] = mk;
       }
 
       // Impact ring burst at home when arc arrives (spawned lazily in animate loop)
-      s.arcs.push({ id: arcId, curve, geom, line, dot, t: Math.random() * 0.25, speed: 0.003 + Math.random() * 0.005, phase: Math.random() * Math.PI * 2, col, pulsed: false });
+      s.arcs.push({ id: arcId, curve, geom, line, dot, inbound, t: Math.random() * 0.25, speed: (0.003 + Math.random() * 0.005) * (_reduceMotion ? 0.4 : 1), phase: Math.random() * Math.PI * 2, col, pulsed: false });
 
       // Prune oldest arcs
       if (s.arcs.length > 70) {
@@ -614,7 +676,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         old.geom.dispose(); old.line.material.dispose(); old.dot.material.dispose();
       }
     });
-  }, [alerts.length, geoV]);
+  }, [alerts.length, alerts[0]?.id, geoV]);
 
   // ── Resolve GeoIPs for flow external endpoints ───────────────────────────────
   useEffect(() => {
@@ -622,7 +684,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
     const ips = [...new Set(flows.map(f => f.ext_ip).filter(ip => ip && !_isPrivate3d(ip)))];
     const unknown = ips.filter(ip => !_geo3d[ip]);
     if (unknown.length) _resolveGeo3d(unknown, backendUrl).then(ok => { if (ok) setGeoV(v => v + 1); });
-  }, [flows.length, showAllTraffic]);
+  }, [flows.length, flows[0]?.id, showAllTraffic]);
 
   // ── Add dim arcs for all-traffic flows ───────────────────────────────────────
   useEffect(() => {
@@ -654,8 +716,7 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       const h = ll(HOME[0], HOME[1], GR + 0.01);
       const from = flow.direction === "outbound" ? h : a;
       const to   = flow.direction === "outbound" ? a : h;
-      const mid  = new THREE.Vector3().addVectors(from, to).normalize().multiplyScalar(GR * (1.25 + Math.random() * 0.4));
-      const curve = new THREE.QuadraticBezierCurve3(from, mid, to);
+      const curve = arcCurve(from, to);
       const col = DIR_HEX[flow.direction] || DIR_HEX.external;
 
       const geom = new THREE.BufferGeometry();
@@ -673,25 +734,30 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
         old.geom.dispose(); old.line.material.dispose(); old.dot.material.dispose();
       }
     });
-  }, [flows.length, geoV, showAllTraffic]);
+  }, [flows.length, flows[0]?.id, geoV, showAllTraffic]);
 
   // ── Derived stats for sidebar ─────────────────────────────────────────────────
+  const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
   const topAtk = Object.entries(
     alerts.slice(0, 500).reduce((acc, x) => {
-      if (_isPrivate3d(x.src_ip)) return acc;
-      // Prefer backend country → ip-api geo cache → raw IP as fallback (never "??")
-      const geoEntry = _geo3d[x.src_ip];
-      const cc  = x.country || geoEntry?.cc  || "";
-      const label = x.country || geoEntry?.country || x.src_ip || "Unknown";
-      const k   = cc || `ip:${x.src_ip}`;
-      if (!acc[k]) acc[k] = { country: cc, label, src_ip: x.src_ip || "", hits: 0, sev: x.severity, city: geoEntry?.city || "" };
-      acc[k].hits++; acc[k].sev = x.severity;
-      if (!acc[k].country && cc) { acc[k].country = cc; acc[k].label = label; }
+      const ext = _extOf(x);
+      if (!ext) return acc;
+      const inbound = ext === x.src_ip;
+      const geoEntry = _geo3d[ext];
+      // ISO code from the geo cache; the backend's country field only describes src_ip
+      const cc = geoEntry?.cc || (inbound && /^[A-Z]{2}$/.test(x.country || "") ? x.country : "");
+      const k  = cc || `ip:${ext}`;
+      if (!acc[k]) acc[k] = { country: cc, label: countryName(cc, geoEntry?.country || ext), ip: ext, cities: {}, hits: 0, inb: 0, out: 0, sev: x.severity };
+      const a = acc[k];
+      a.hits++; inbound ? a.inb++ : a.out++;
+      if (geoEntry?.city) a.cities[geoEntry.city] = (a.cities[geoEntry.city] || 0) + 1;
+      if ((SEV_RANK[x.severity] ?? 0) > (SEV_RANK[a.sev] ?? 0)) a.sev = x.severity;   // worst seen, not last seen
       return acc;
     }, {})
-  ).map(([, v]) => v).sort((a, b) => b.hits - a.hits).slice(0, 8);
+  ).map(([, v]) => ({ ...v, city: Object.entries(v.cities).sort((a, b) => b[1] - a[1])[0]?.[0] || "" }))
+   .sort((a, b) => b.hits - a.hits).slice(0, 6);
 
-  const SC = { critical: "#ff2d55", high: "#ff9f0a", medium: "#ffd60a", low: "#30d158", info: "#0a84ff" };
+  const SC = { critical: "#ff2d55", high: "#ff9f0a", medium: "#ffd60a", low: "#64d2ff", info: "#0a84ff" };
   const totalHits = topAtk.reduce((s, a) => s + a.hits, 0);
 
   return (
@@ -710,15 +776,20 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           {showAllTraffic ? <Eye size={11}/> : <EyeOff size={11}/>}
           {showAllTraffic ? "ALL TRAFFIC" : "ALERTS ONLY"}
         </button>
-        <span style={{ fontSize:10, color:"#4a5568", fontFamily:"monospace" }}>{totalHits.toLocaleString()} attacks tracked</span>
+        <span style={{ fontSize:10, color:"#6b7a90", fontFamily:"monospace" }}>{totalHits.toLocaleString()} alerts mapped</span>
+        <button onClick={recentre} title="Centre on home (or double-click the globe)" aria-label="Centre the globe on home"
+          style={{ pointerEvents:"auto", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", width:26, height:24,
+            borderRadius:7, border:"1px solid #1a2535", background:"rgba(2,4,9,0.6)", color:"#8e8e93" }}>
+          <Crosshair size={12}/>
+        </button>
       </div>
 
       {/* ── 3D Canvas ── */}
-      <div ref={mountRef} style={{ width:"100%", height:520, cursor:"grab" }}/>
+      <div ref={mountRef} style={{ width:"100%", height:globeHeight(1000), cursor:"grab" }}/>
 
       {/* ── Legend ── */}
       <div style={{ position:"absolute", bottom:14, left:14, zIndex:20, display:"flex", gap:10, background:"rgba(2,4,9,0.82)", padding:"6px 12px", borderRadius:8, border:"1px solid #1a2535", pointerEvents:"none" }}>
-        {[["#30d158","Home (LU)"],["#ff2d55","Critical"],["#ff9f0a","High"],["#ffd60a","Medium"],["#0a84ff","Low"]].map(([c,l])=>(
+        {[["#30d158","Home (LU)"],["#ff2d55","Critical"],["#ff9f0a","High"],["#ffd60a","Medium"],["#64d2ff","Low"]].map(([c,l])=>(
           <span key={l} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:"#8e8e93", fontFamily:"monospace" }}>
             <span style={{ width:7, height:7, borderRadius:"50%", background:c, display:"inline-block", boxShadow:`0 0 6px ${c}` }}/>
             {l}
@@ -729,18 +800,23 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
       {/* ── Top Attack Origins sidebar ── */}
       <div style={{ position:"absolute", top:44, right:12, zIndex:20, width:188, background:"rgba(2,4,9,0.88)", borderRadius:10, border:"1px solid #1a2535", padding:"10px 12px" }}>
         <div style={{ fontSize:9, fontWeight:700, color:"#4a5568", letterSpacing:"0.13em", marginBottom:10, fontFamily:"monospace", display:"flex", alignItems:"center", gap:4 }}>
-          <TrendingUp size={9}/> TOP ATTACK ORIGINS
+          <TrendingUp size={9}/> TOP EXTERNAL ENDPOINTS
         </div>
         {topAtk.map((a, i) => {
           const col = SC[a.sev] || SC.info;
           return (
-            <div key={a.src_ip || a.country} style={{ marginBottom:8 }}>
+            <div key={a.country || a.ip} style={{ marginBottom:8 }}>
               <div style={{ display:"flex", alignItems:"center", gap:5, marginBottom:2 }}>
                 <span style={{ fontSize:9, color:"#4a5568", fontFamily:"monospace", width:12, textAlign:"right", flexShrink:0 }}>{i + 1}</span>
-                <span style={{ fontSize:10, color:"white", fontFamily:"monospace", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                  {FLAG[a.country] || "🌐"} {a.label || a.src_ip || "Unknown"}{a.city ? `, ${a.city}` : ""}
+                <span title={a.ip} style={{ fontSize:10, color:"white", fontFamily:"monospace", flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  {FLAG[a.country] || "🌐"} {a.label || a.ip || "Unknown"}
                 </span>
                 <span style={{ fontSize:10, fontWeight:700, color:col, fontFamily:"monospace" }}>{a.hits}</span>
+              </div>
+              <div style={{ display:"flex", gap:6, marginLeft:17, marginBottom:3, fontSize:9, fontFamily:"monospace", color:"#6b7a90" }}>
+                <span style={{ flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{a.city || a.ip}</span>
+                {a.inb > 0 && <span title="Alerts coming in from here">↓{a.inb}</span>}
+                {a.out > 0 && <span title="Alerts going out to here" style={{ color:"#ff9f0a" }}>↑{a.out}</span>}
               </div>
               <div style={{ height:2, background:"#0d1117", borderRadius:1, marginLeft:17, overflow:"hidden" }}>
                 <div style={{ height:"100%", background:`linear-gradient(90deg,${col}cc,${col}33)`, width:`${(a.hits / (topAtk[0]?.hits || 1)) * 100}%`, transition:"width 1s ease", borderRadius:1 }}/>
@@ -749,13 +825,13 @@ function GeoMap({ alerts, backendUrl, flows = [], showAllTraffic = true, setShow
           );
         })}
         {topAtk.length === 0 && (
-          <div style={{ fontSize:9, color:"#2d3748", fontFamily:"monospace", textAlign:"center", padding:"10px 0" }}>No external attacks yet…</div>
+          <div style={{ fontSize:9, color:"#6b7a90", fontFamily:"monospace", textAlign:"center", padding:"10px 0" }}>No alerts with an external address yet</div>
         )}
       </div>
 
       {/* ── Drag hint ── */}
-      <div style={{ position:"absolute", bottom:14, right:14, zIndex:20, fontSize:9, color:"#2d3748", fontFamily:"monospace", pointerEvents:"none" }}>
-        drag to rotate
+      <div style={{ position:"absolute", bottom:14, right:14, zIndex:20, fontSize:9, color:"#4a5568", fontFamily:"monospace", pointerEvents:"none" }}>
+        Drag to rotate, double-click to centre
       </div>
     </div>
   );
