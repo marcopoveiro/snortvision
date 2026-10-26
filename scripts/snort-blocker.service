@@ -1,0 +1,29 @@
+[Unit]
+Description=Snort 3 -> OPNsense: quarantine/block through firewall aliases (alias_util)
+After=network-online.target snort3.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=snort
+Group=snort
+# 1 = dry run (log only); 0 = apply on the router
+Environment=DRY_RUN=1
+Environment=BLOCK_HOURS=24
+Environment=MAX_PER_HOUR=10
+# Home networks (may be quarantined) and networks that are never blocked, separated by commas
+#Environment=HOME_NETS=192.168.10.0/24
+#Environment=NEVER_BLOCK_NETS=192.168.1.0/24
+Environment=API_KEY_FILE=/etc/snort-blocker/opnsense.key
+Environment=ROUTER_CERT=/etc/snort-blocker/router.pem
+ExecStart=/usr/bin/python3 /opt/snortvision/scripts/snort-blocker.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/snort-blocker /var/log/snort-blocker
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
