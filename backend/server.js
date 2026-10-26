@@ -19,6 +19,7 @@ const fetch      = require("node-fetch");
 const cors       = require("cors");
 const { exec, spawn } = require("child_process");
 const net = require("net");
+const https = require("https");
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT     = parseInt(process.env.PORT     || "4000");
@@ -158,6 +159,23 @@ async function getMainRouterTrafficTelemetry() {
       tx_pps: 0,
       packet_pps: 0,
       mbps: 0,
+    };
+  }
+
+  const platform = normalizeRouterType(cfg.routerType);
+  if (platform === "OPNsense" || platform === "pfSense") {
+    const parsed = platform === "OPNsense" ? await readOpnsenseCounters(cfg) : await readFreeBsdCounters(cfg);
+    const wanted = cleanValue(cfg.monitorInterface) ? parseInterfaceList(cfg.monitorInterface) : ["wan"];
+    const present = wanted.filter(iface => !!parsed[iface]);
+    if (!present.length) {
+      return { real: false, interface: wanted.join(","), source: "main-router-selected",
+        error: `Router interface not found: ${wanted.join(", ")}`, rx_pps: 0, tx_pps: 0, packet_pps: 0, mbps: 0 };
+    }
+    return {
+      real: true,
+      interface: present.join(","),
+      source: cleanValue(cfg.monitorInterface) ? "main-router-selected" : "main-router-auto",
+      ...buildTrafficSnapshot(`main-router:${cfg.ip}:${present.join(',')}`, sumInterfaceCounters(parsed, present)),
     };
   }
 
@@ -546,7 +564,7 @@ function getConnConfig() {
 }
 
 function getRouterConfig() {
-  return dbGet("router_connection", {
+  const defaults = {
     ip: process.env.ROUTER_HOST || "",
     port: process.env.ROUTER_SSH_PORT || "22",
     user: process.env.ROUTER_SSH_USER || "root",
@@ -556,8 +574,39 @@ function getRouterConfig() {
     routerType: process.env.ROUTER_TYPE || "OpenWRT",
     monitorInterface: process.env.ROUTER_MONITOR_IFACE || "",
     mirrorTarget: process.env.ROUTER_MIRROR_TARGET || "",
+    apiPort: process.env.ROUTER_API_PORT || "443",
+    apiKey: process.env.ROUTER_API_KEY || "",
+    apiSecret: process.env.ROUTER_API_SECRET || "",
+    apiCertSha256: "",
+    // Monitor only unless someone explicitly allows SnortVision to change the router.
+    readOnly: process.env.ROUTER_READ_ONLY !== "false",
     note: "",
-  });
+  };
+  return { ...defaults, ...dbGet("router_connection", {}) };
+}
+
+// Secrets never leave the server: the browser only learns whether one is set.
+const ROUTER_SECRETS = ["password", "apiKey", "apiSecret"];
+const SENSOR_SECRETS = ["password", "sudoPassword"];
+
+function redactConfig(cfg, secrets) {
+  const out = { ...cfg };
+  for (const k of secrets) {
+    out[`has${k[0].toUpperCase()}${k.slice(1)}`] = !!cleanValue(cfg[k]);
+    delete out[k];
+  }
+  return out;
+}
+
+// An empty secret in a save means "keep the one already stored".
+function mergeConfig(base, body, secrets) {
+  const out = { ...base };
+  for (const [k, v] of Object.entries(body || {})) {
+    if (k.startsWith("has")) continue;
+    if (secrets.includes(k) && !cleanValue(v)) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function buildSshOptions(cfg = getConnConfig()) {
@@ -688,8 +737,114 @@ function normalizeRouterType(value = "") {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return "OpenWRT";
   if (raw.includes("openwrt")) return "OpenWRT";
+  if (raw.includes("opnsense")) return "OPNsense";
+  if (raw.includes("pfsense")) return "pfSense";
   if (raw.includes("generic")) return "Generic Router/Linux";
   return value;
+}
+
+// What SnortVision can do on each router platform. "api" = HTTPS REST with a key
+// pair, "ssh" = shell commands. canEnforce = the backend knows how to push blocks
+// there; when false (or the target is set to read-only) blocks stay on the sensor.
+const ROUTER_PLATFORMS = {
+  "OPNsense":             { transport: "api", canEnforce: false, canMirror: false },
+  "pfSense":              { transport: "ssh", canEnforce: false, canMirror: false },
+  "OpenWRT":              { transport: "ssh", canEnforce: true,  canMirror: true  },
+  "Generic Router/Linux": { transport: "ssh", canEnforce: true,  canMirror: false },
+};
+
+function routerPlatform(cfg = getRouterConfig()) {
+  return ROUTER_PLATFORMS[normalizeRouterType(cfg.routerType)] || ROUTER_PLATFORMS["Generic Router/Linux"];
+}
+
+function routerCanEnforce(cfg = getRouterConfig()) {
+  return !!cleanValue(cfg.ip) && routerPlatform(cfg).canEnforce && cfg.readOnly === false;
+}
+
+// Talks to the OPNsense REST API with a key pair. The router's certificate is
+// normally self-signed, so it is pinned on first use (SHA-256) instead of being
+// checked against a CA; a later mismatch is refused.
+function opnsenseApi(cfg, apiPath, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    if (!cleanValue(cfg.apiKey) || !cleanValue(cfg.apiSecret)) return reject(new Error("OPNsense API key and secret are not set"));
+    const req = https.request({
+      host: cfg.ip,
+      port: parseInt(cfg.apiPort || "443", 10),
+      path: `/api/${apiPath}`,
+      method: "GET",
+      auth: `${cfg.apiKey}:${cfg.apiSecret}`,
+      rejectUnauthorized: false,
+      timeout: timeoutMs,
+      headers: { Accept: "application/json" },
+    }, (res) => {
+      const fp = res.socket.getPeerCertificate()?.fingerprint256 || "";
+      if (cfg.apiCertSha256 && fp && fp !== cfg.apiCertSha256) {
+        res.destroy();
+        return reject(new Error(`Router certificate changed (pinned ${cfg.apiCertSha256.slice(0, 23)}…, got ${fp.slice(0, 23)}…) — re-pin it in Connection if this is expected`));
+      }
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", c => { body += c; });
+      res.on("end", () => {
+        if (res.statusCode === 401 || res.statusCode === 403) return reject(new Error(`OPNsense API refused the key (HTTP ${res.statusCode}) — check the key pair and the user's privileges`));
+        if (res.statusCode >= 400) return reject(new Error(`OPNsense API ${apiPath}: HTTP ${res.statusCode}`));
+        try { resolve({ data: JSON.parse(body), fingerprint: fp }); }
+        catch { reject(new Error(`OPNsense API ${apiPath}: invalid JSON`)); }
+      });
+    });
+    req.on("timeout", () => req.destroy(new Error(`OPNsense API timeout on ${cfg.ip}`)));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// Pins the router certificate the first time the API answers.
+function pinRouterCertificate(cfg, fingerprint) {
+  if (!fingerprint || cfg.apiCertSha256) return;
+  const stored = dbGet("router_connection", null);
+  if (stored && stored.ip === cfg.ip) dbSet("router_connection", { ...stored, apiCertSha256: fingerprint });
+  cfg.apiCertSha256 = fingerprint;
+}
+
+// OPNsense traffic counters keyed by both the logical name (wan, lan, opt3)
+// and the device (igc0, vlan0.61), in the shape sumInterfaceCounters expects.
+async function readOpnsenseCounters(cfg) {
+  const { data, fingerprint } = await opnsenseApi(cfg, "diagnostics/traffic/interface");
+  pinRouterCertificate(cfg, fingerprint);
+  const out = {};
+  for (const [name, it] of Object.entries(data?.interfaces || {})) {
+    const row = {
+      rxBytes: Number(it["bytes received"]) || 0,
+      rxPackets: Number(it["packets received"]) || 0,
+      txBytes: Number(it["bytes transmitted"]) || 0,
+      txPackets: Number(it["packets transmitted"]) || 0,
+    };
+    out[name] = row;
+    if (it.device) out[it.device] = row;
+  }
+  return out;
+}
+
+// pfSense / FreeBSD over SSH: netstat -ibn gives one Link# row per interface.
+async function readFreeBsdCounters(cfg) {
+  const result = await sshExecCommand("netstat -ibn", cfg, 15000);
+  const out = {};
+  const lines = String(result.stdout || "").split("\n");
+  const head = (lines.shift() || "").trim().split(/\s+/);
+  const col = n => head.indexOf(n);
+  for (const line of lines) {
+    const c = line.trim().split(/\s+/);
+    if (c.length < head.length || !String(c[2] || "").startsWith("<Link#")) continue;
+    // Rows without an address have one column fewer than the header.
+    const shift = c.length - head.length;
+    out[c[0]] = {
+      rxBytes: Number(c[col("Ibytes") + shift]) || 0,
+      rxPackets: Number(c[col("Ipkts") + shift]) || 0,
+      txBytes: Number(c[col("Obytes") + shift]) || 0,
+      txPackets: Number(c[col("Opkts") + shift]) || 0,
+    };
+  }
+  return out;
 }
 
 async function sshExecValue(command, cfg, timeoutMs = 8000) {
@@ -821,7 +976,7 @@ async function removeLocalBlock(target) {
 
 async function applyBlockToPreferredTarget(target, durationMinutes = 60) {
   const routerCfg = getRouterConfig();
-  if (cleanValue(routerCfg.ip)) {
+  if (routerCanEnforce(routerCfg)) {
     try {
       return await applyBlockToMainRouter(target, durationMinutes, routerCfg);
     } catch (err) {
@@ -837,7 +992,7 @@ async function applyBlockToPreferredTarget(target, durationMinutes = 60) {
 
 async function removeBlockFromPreferredTarget(target) {
   const routerCfg = getRouterConfig();
-  if (cleanValue(routerCfg.ip)) {
+  if (routerCanEnforce(routerCfg)) {
     try {
       return await removeBlockFromMainRouter(target, routerCfg);
     } catch (err) {
@@ -871,7 +1026,7 @@ async function reconcilePreferredBlocklist(blockEntries = []) {
   }
   return {
     ok: results.every(r => r.ok),
-    target: cleanValue(getRouterConfig().ip) ? "main-router" : "sensor-local",
+    target: routerCanEnforce() ? "main-router" : "sensor-local",
     applied: results.filter(r => r.ok).length,
     failed: results.filter(r => !r.ok).length,
     results,
@@ -983,7 +1138,7 @@ async function clearMitigationLocally() {
 
 async function applyMitigationToPreferredTarget(settings) {
   const cfg = getRouterConfig();
-  if (cleanValue(cfg.ip)) {
+  if (routerCanEnforce(cfg)) {
     return normalizeRouterType(cfg.routerType) === "OpenWRT"
       ? applyMitigationToOpenWrt(settings, cfg)
       : applyMitigationLocally(settings); // generic router: best-effort iptables over SSH not implemented; sensor only
@@ -993,7 +1148,7 @@ async function applyMitigationToPreferredTarget(settings) {
 
 async function clearMitigationOnPreferredTarget() {
   const cfg = getRouterConfig();
-  if (cleanValue(cfg.ip) && normalizeRouterType(cfg.routerType) === "OpenWRT") {
+  if (routerCanEnforce(cfg) && normalizeRouterType(cfg.routerType) === "OpenWRT") {
     return clearMitigationOnOpenWrt(cfg);
   }
   return clearMitigationLocally();
@@ -1069,6 +1224,73 @@ async function gatherGenericRouterInfo(cfg) {
   };
 }
 
+async function gatherOpnsenseRouterInfo(cfg) {
+  const { data: sys, fingerprint } = await opnsenseApi(cfg, "diagnostics/system/system_information");
+  pinRouterCertificate(cfg, fingerprint);
+  const [stats, traffic, pf] = await Promise.all([
+    opnsenseApi(cfg, "diagnostics/interface/get_interface_statistics").then(r => r.data?.statistics || {}).catch(() => ({})),
+    opnsenseApi(cfg, "diagnostics/traffic/interface").then(r => r.data?.interfaces || {}).catch(() => ({})),
+    opnsenseApi(cfg, "diagnostics/firewall/pf_states").then(r => r.data || {}).catch(() => ({})),
+  ]);
+  // get_interface_statistics keys look like "[WAN] (igc0) / 203.0.113.7".
+  const addrOf = (descr) => {
+    for (const key of Object.keys(stats)) {
+      const m = key.match(/^\[([^\]]+)\](?: \(([^)]+)\))? \/ (\S+)$/);
+      if (m && m[1].toLowerCase() === descr && /^\d+\.\d+\.\d+\.\d+$/.test(m[3])) return m[3];
+    }
+    return "";
+  };
+  const names = Object.keys(traffic);
+  const devices = names.map(n => `${n}=${traffic[n].device || "?"}`);
+  const monitor = firstNonEmpty(cleanValue(cfg.monitorInterface), "wan");
+  const mon = traffic[monitor] || Object.values(traffic).find(t => t.device === monitor);
+  return {
+    platform: "OPNsense",
+    hostname: cleanValue(sys?.name),
+    firmwareVersion: (sys?.versions || []).slice(0, 2).join(" • "),
+    wanIp: addrOf("wan"),
+    lanIp: addrOf("lan") || cfg.ip,
+    monitoredInterface: monitor,
+    wanInterface: traffic.wan?.device || "",
+    lanBridge: traffic.lan?.device || "",
+    bridgeNames: devices.join(", "),
+    firewallZones: `${names.length} interfaces`,
+    mirrorSpanTarget: cleanValue(cfg.mirrorTarget, "not specified"),
+    tcpdump: "n/a (API)",
+    packetCounters: mon ? `RX=${mon["bytes received"]} TX=${mon["bytes transmitted"]}` : "",
+    candidateInterfaces: names.join(","),
+    packages: pf?.current != null ? `pf states ${pf.current}/${pf.limit}` : "n/a",
+    certificateSha256: cfg.apiCertSha256 || fingerprint || "",
+  };
+}
+
+async function gatherPfSenseRouterInfo(cfg) {
+  const hostname = await sshExecValue(`hostname`, cfg);
+  const firmware = await sshExecValue(`cat /etc/version 2>/dev/null; uname -r`, cfg);
+  const interfaces = await sshExecValue(`ifconfig -l`, cfg);
+  const monitorIf = firstNonEmpty(cleanValue(cfg.monitorInterface), await sshExecValue(`route -n get default 2>/dev/null | awk '/interface:/{print $2}'`, cfg));
+  const wanIp = monitorIf ? await sshExecValue(`ifconfig ${JSON.stringify(monitorIf)} 2>/dev/null | awk '/inet /{print $2; exit}'`, cfg) : "";
+  const counters = await readFreeBsdCounters(cfg).catch(() => ({}));
+  const mon = counters[monitorIf];
+  return {
+    platform: "pfSense",
+    hostname,
+    firmwareVersion: firmware.replace(/\s+/g, " "),
+    wanIp,
+    lanIp: cfg.ip,
+    monitoredInterface: monitorIf,
+    wanInterface: monitorIf,
+    lanBridge: "",
+    bridgeNames: interfaces.replace(/\s+/g, ","),
+    firewallZones: "pf",
+    mirrorSpanTarget: cleanValue(cfg.mirrorTarget, "not specified"),
+    tcpdump: await sshExecValue(`command -v tcpdump >/dev/null 2>&1 && echo installed || echo missing`, cfg),
+    packetCounters: mon ? `RX=${mon.rxBytes} TX=${mon.txBytes}` : "",
+    candidateInterfaces: interfaces.replace(/\s+/g, ","),
+    packages: await sshExecValue(`pkg info 2>/dev/null | grep -Ei 'snort|suricata' | awk '{print $1}' | paste -sd ',' -`, cfg) || "none detected",
+  };
+}
+
 async function getRouterTelemetry(cfg = getRouterConfig()) {
   const info = {
     routerType: normalizeRouterType(cfg.routerType),
@@ -1085,12 +1307,27 @@ async function getRouterTelemetry(cfg = getRouterConfig()) {
     return info;
   }
 
+  const transport = routerPlatform(cfg).transport;
+  info.transport = transport;
+  info.readOnly = !routerCanEnforce(cfg);
+  if (transport === "api") info.port = cleanValue(cfg.apiPort, "443");
   const reachability = await testTcpPort(info.ip, info.port, 3500);
   info.reachable = !!reachability.ok;
   info.latencyMs = reachability.latencyMs ?? null;
   if (!reachability.ok) {
     info.error = reachability.error || `TCP probe failed for ${info.ip}:${info.port}`;
     return info;
+  }
+
+  if (transport === "api") {
+    try {
+      const details = await gatherOpnsenseRouterInfo(cfg);
+      // sshConnected stays the "logged in" flag the UI already understands.
+      return { ...info, sshConnected: true, ...details };
+    } catch (err) {
+      info.error = err.message;
+      return info;
+    }
   }
 
   try {
@@ -1101,8 +1338,8 @@ async function getRouterTelemetry(cfg = getRouterConfig()) {
     return info;
   }
 
-  const details = info.routerType === "OpenWRT"
-    ? await gatherOpenWrtRouterInfo(cfg)
+  const details = info.routerType === "OpenWRT" ? await gatherOpenWrtRouterInfo(cfg)
+    : info.routerType === "pfSense" ? await gatherPfSenseRouterInfo(cfg)
     : await gatherGenericRouterInfo(cfg);
 
   return {
@@ -1863,7 +2100,7 @@ app.post("/api/blocklist", auth, async (req, res) => {
     db.prepare("INSERT OR REPLACE INTO blocklist (ip,reason,source,active) VALUES (?,?,?,?)").run(parsed.target, reason || "Manual", source || "Manual", active ? 1 : 0);
     const row = db.prepare("SELECT * FROM blocklist WHERE ip=?").get(parsed.target);
     const enforcement = active ? await applyBlockToPreferredTarget(parsed.target, durationMinutes) : { ok: true, target: parsed.target, engine: "database-only" };
-    res.json({ ok: true, row, enforcement, target: cleanValue(getRouterConfig().ip) ? "main-router" : "sensor-local" });
+    res.json({ ok: true, row, enforcement, target: routerCanEnforce() ? "main-router" : "sensor-local" });
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
@@ -1934,6 +2171,7 @@ app.post("/api/router/reconcile", auth, async (req, res) => {
 app.get("/api/router/mirror/probe", auth, async (req, res) => {
   const cfg = getRouterConfig();
   if (!cleanValue(cfg.ip)) return res.status(400).json({ ok: false, message: "Main router not configured" });
+  if (!routerPlatform(cfg).canMirror) return res.status(400).json({ ok:false, message:`Traffic mirroring is not supported on ${normalizeRouterType(cfg.routerType)}` });
   // NOTE: no $ / $(...) — the script is wrapped in double quotes through `sh -lc`,
   // so shell variables would expand at the wrong layer. Keep commands literal.
   const probe = [
@@ -1989,6 +2227,8 @@ function buildMirrorRemove(bridges) {
 app.post("/api/router/mirror/apply", auth, async (req, res) => {
   const cfg = getRouterConfig();
   if (!cleanValue(cfg.ip)) return res.status(400).json({ ok:false, message:"Main router not configured" });
+  if (!routerPlatform(cfg).canMirror) return res.status(400).json({ ok:false, message:`Traffic mirroring is not supported on ${normalizeRouterType(cfg.routerType)}` });
+  if (!routerCanEnforce(cfg)) return res.status(403).json({ ok:false, message:"The router is set to read-only in Connection" });
   const bridges = (req.body?.bridges || []).filter(b => SAFE_BR.test(b));
   if (!bridges.length) return res.status(400).json({ ok:false, message:"No valid bridge(s) given" });
   const sensorIp = classifyNetworkTarget(req.body?.sensorIp || "").ok ? req.body.sensorIp : "";
@@ -2004,6 +2244,8 @@ app.post("/api/router/mirror/apply", auth, async (req, res) => {
 app.post("/api/router/mirror/remove", auth, async (req, res) => {
   const cfg = getRouterConfig();
   if (!cleanValue(cfg.ip)) return res.status(400).json({ ok:false, message:"Main router not configured" });
+  if (!routerPlatform(cfg).canMirror) return res.status(400).json({ ok:false, message:`Traffic mirroring is not supported on ${normalizeRouterType(cfg.routerType)}` });
+  if (!routerCanEnforce(cfg)) return res.status(403).json({ ok:false, message:"The router is set to read-only in Connection" });
   const bridges = (req.body?.bridges || ["br-lan","br-company","br-eva","br-iot","br-paineis"]).filter(b => SAFE_BR.test(b));
   try {
     const r = await sshExecCommand(`sh -lc ${JSON.stringify(buildMirrorRemove(bridges))}`, cfg, 25000);
@@ -2049,7 +2291,7 @@ app.post("/api/mitigation/clear", auth, async (req, res) => {
 
 app.get("/api/mitigation/status", auth, async (req, res) => {
   const cfg = getRouterConfig();
-  const onRouter = cleanValue(cfg.ip) && normalizeRouterType(cfg.routerType) === "OpenWRT";
+  const onRouter = routerCanEnforce(cfg) && normalizeRouterType(cfg.routerType) === "OpenWRT";
   try {
     let active = false, output = "", engine = onRouter ? "router-nft" : "sensor-local-iptables", target = onRouter ? cfg.ip : "sensor";
     if (onRouter) {
@@ -2072,7 +2314,7 @@ app.get("/api/router/block-status", auth, async (req, res) => {
   if (!cleanValue(cfg.ip)) return res.json({ ok: false, configured: false, message: "Main router not configured" });
   try {
     const info = await getRouterTelemetry(cfg);
-    res.json({ ok: true, configured: true, target: cfg.ip, hostname: info.hostname || "", routerType: normalizeRouterType(cfg.routerType), monitorInterface: info.monitoredInterface || cfg.monitorInterface || "", reachable: info.reachable, sshConnected: info.sshConnected, engine: normalizeRouterType(cfg.routerType) === "OpenWRT" ? "router-nft" : "router-iptables" });
+    res.json({ ok: true, configured: true, target: cfg.ip, hostname: info.hostname || "", routerType: normalizeRouterType(cfg.routerType), monitorInterface: info.monitoredInterface || cfg.monitorInterface || "", reachable: info.reachable, sshConnected: info.sshConnected, engine: !routerCanEnforce(cfg) ? "read-only" : normalizeRouterType(cfg.routerType) === "OpenWRT" ? "router-nft" : "router-iptables", readOnly: !routerCanEnforce(cfg) });
   } catch (err) {
     res.status(500).json({ ok: false, configured: true, message: err.message });
   }
@@ -2463,7 +2705,7 @@ echo __SNORTVISION_RC__=$RC
 // ── Firewall / enforcement snapshot ───────────────────────────────────────────
 app.get("/api/iptables", auth, async (req, res) => {
   const routerCfg = getRouterConfig();
-  if (cleanValue(routerCfg.ip)) {
+  if (routerCanEnforce(routerCfg)) {
     try {
       const blockset = await fetchMainRouterBlockset(routerCfg);
       return res.json({ output: blockset.output || "(empty)", engine: blockset.engine || "main-router", target: routerCfg.ip, mode: "main-router" });
@@ -2477,11 +2719,11 @@ app.get("/api/iptables", auth, async (req, res) => {
 });
 
 // ── Connection config ─────────────────────────────────────────────────────────
-app.get("/api/config/connection", auth, (req, res) => res.json(getConnConfig()));
+app.get("/api/config/connection", auth, (req, res) => res.json(redactConfig(getConnConfig(), SENSOR_SECRETS)));
 
 app.post("/api/config/connection", auth, (req, res) => {
-  dbSet("connection", req.body);
-  const cfg = req.body;
+  const cfg = mergeConfig(getConnConfig(), req.body, SENSOR_SECRETS);
+  dbSet("connection", cfg);
 
   // Write to .env for persistence across restarts
   updateEnvFile({
@@ -2521,15 +2763,19 @@ app.post("/api/config/connection", auth, (req, res) => {
     .connect(opts);
 });
 
-app.get("/api/config/router", auth, (req, res) => res.json(getRouterConfig()));
+app.get("/api/config/router", auth, (req, res) => res.json({
+  ...redactConfig(getRouterConfig(), ROUTER_SECRETS),
+  platforms: ROUTER_PLATFORMS,
+}));
 
 app.post("/api/config/router", auth, async (req, res) => {
   const base = getRouterConfig();
-  const cfg = {
-    ...base,
-    ...req.body,
-    routerType: normalizeRouterType(req.body.routerType || base.routerType),
-  };
+  const cfg = mergeConfig(base, req.body, ROUTER_SECRETS);
+  cfg.routerType = normalizeRouterType(cfg.routerType);
+  cfg.readOnly = cfg.readOnly !== false;
+  // A new address or a re-pin request drops the pinned certificate.
+  if (cfg.ip !== base.ip || req.body.repinCertificate) cfg.apiCertSha256 = "";
+  delete cfg.repinCertificate;
 
   dbSet("router_connection", cfg);
   updateEnvFile({
@@ -2540,6 +2786,8 @@ app.post("/api/config/router", auth, async (req, res) => {
     ROUTER_TYPE: cfg.routerType || "OpenWRT",
     ROUTER_MONITOR_IFACE: cfg.monitorInterface || "",
     ROUTER_MIRROR_TARGET: cfg.mirrorTarget || "",
+    ROUTER_API_PORT: cfg.apiPort || "443",
+    ROUTER_READ_ONLY: cfg.readOnly ? "true" : "false",
   });
 
   if (!cfg.ip) {
@@ -2549,7 +2797,7 @@ app.post("/api/config/router", auth, async (req, res) => {
   try {
     const info = await getRouterTelemetry(cfg);
     if (!info.reachable)   return res.json({ ok: false, message: info.error || `Router ${cfg.ip} is unreachable`, info });
-    if (!info.sshConnected) return res.json({ ok: false, message: info.error || `SSH login failed for ${cfg.ip}`, info });
+    if (!info.sshConnected) return res.json({ ok: false, message: info.error || `Login failed for ${cfg.ip}`, info });
     return res.json({ ok: true, message: `Router ${cfg.ip} connected`, info });
   } catch(e) {
     return res.json({ ok: false, message: `Router connection error: ${e.message}` });
@@ -3046,7 +3294,7 @@ app.get("/api/db/stats", auth, (req, res) => {
   const dbSizeBytes = (() => { try { return fs.statSync(DB_PATH).size; } catch { return 0; } })();
   const configRows  = db.prepare("SELECT COUNT(*) as c FROM config").get().c;
   const blocklistRows = db.prepare("SELECT COUNT(*) as c FROM blocklist").get().c;
-  res.json({ count, oldest: oldest?.ts || null, newest: newest?.ts || null, dbSizeBytes, maxAlerts: MAX_ALERTS, configRows, blocklistRows });
+  res.json({ count, oldest: oldest?.ts || null, newest: newest?.ts || null, dbSizeBytes, maxAlerts: MAX_ALERTS, retentionDays: ALERT_RETENTION_DAYS, engine: "SQLite", path: DB_PATH, configRows, blocklistRows });
 });
 
 // ─── Generic DB browser API (powers the standalone /db viewer) ───────────────

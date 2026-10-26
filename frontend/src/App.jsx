@@ -1036,7 +1036,9 @@ function SnortAPIPanel({ backendUrl, setBackendUrl, apiKey, setApiKey, status, s
   const [showApiKey,setShowApiKey] = useState(false);
   const [verifying,setVerifying]   = useState(false);
   const [verifyResult,setVerifyResult] = useState(null);
-  const [oinkcode,setOinkcode]     = useState(()=>loadSaved("oinkcode",""));
+  const [oinkcode,setOinkcode]     = useState("");
+  const [trusted,setTrusted]       = useState(null);   // null = unknown, true = server handed this device the key
+  const [showManual,setShowManual] = useState(false);
   const [showOink,setShowOink]     = useState(false);
   const [oinkStatus,setOinkStatus] = useState("idle");
   const [oinkLog,setOinkLog]       = useState([]);
@@ -1044,8 +1046,16 @@ function SnortAPIPanel({ backendUrl, setBackendUrl, apiKey, setApiKey, status, s
   const [apiKeyLocked,setApiKeyLocked] = useState(false);
   const [copied,setCopied]         = useState(false);
 
-  // Persist oinkcode
-  useEffect(()=>{ saveSetting("oinkcode",oinkcode); },[oinkcode]);
+  // The Oinkcode is a subscription secret: it goes to the server, never into browser storage.
+  useEffect(()=>{ try { localStorage.removeItem("sv_oinkcode"); } catch {} },[]);
+
+  // Trusted devices get the API key from the server; everyone else types it once.
+  useEffect(()=>{
+    fetch("/api/public/client-config",{ cache:"no-store" })
+      .then(r=>r.ok?r.json():null)
+      .then(cfg=>setTrusted(!!cfg?.apiKey))
+      .catch(()=>setTrusted(false));
+  },[]);
 
   const testAPI = async () => {
     setVerifying(true); setVerifyResult(null);
@@ -1149,42 +1159,24 @@ function SnortAPIPanel({ backendUrl, setBackendUrl, apiKey, setApiKey, status, s
           {status.toUpperCase()}
         </div>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <div>
-          <label className="text-xs text-gray-500 mb-1 block">Backend URL</label>
-          <input value={backendUrl} onChange={e=>setBackendUrl(e.target.value)} placeholder="http://192.168.1.72:4000"
-            className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-        </div>
-        <div>
-          <label className="text-xs text-gray-500 mb-1 block flex items-center gap-1.5">
-            API Key
-            {apiKeyLocked && <span className="text-yellow-500 flex items-center gap-0.5"><Lock size={9}/>immutable</span>}
-          </label>
-          <div className="relative">
-            <input value={apiKey} onChange={apiKeyLocked?undefined:e=>setApiKey(e.target.value)}
-              readOnly={apiKeyLocked} type={showApiKey?"text":"password"} placeholder="Enter key from backend console"
-              className={`w-full bg-gray-900 border rounded-lg px-3 py-2 pr-16 text-sm text-white font-mono focus:outline-none ${
-                apiKeyLocked?"border-yellow-900/50 cursor-default opacity-80":"border-gray-700 focus:border-blue-500"}`}/>
-            <div className="absolute right-1.5 top-1.5 flex items-center gap-1">
-              <button onClick={copyKey} title="Copy key" className="text-gray-600 hover:text-gray-300 p-1">
-                {copied?<Check size={13} className="text-green-400"/>:<Copy size={13}/>}
-              </button>
-              <button onClick={()=>setShowApiKey(p=>!p)} className="text-gray-600 hover:text-gray-300 p-1">
-                {showApiKey?<EyeOff size={13}/>:<Eye size={13}/>}
-              </button>
-            </div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        {[
+          { label:"Server", value: backendUrl || "same origin", mono:true },
+          { label:"This device", value: trusted===null ? "checking…" : trusted ? "Trusted — key provided by the server" : "Not on the trusted list — key entered by hand",
+            color: trusted ? "#30d158" : trusted===false ? "#ffd60a" : undefined },
+          { label:"API key", value: apiKey ? (maskedKey || `••••${apiKey.slice(-4)}`) : "missing", mono:true, color: apiKey ? undefined : "#ff2d55" },
+        ].map(c=>(
+          <div key={c.label} className="rounded-lg border border-gray-800 bg-black/30 px-3 py-2">
+            <div className="text-[11px] text-gray-500 mb-0.5">{c.label}</div>
+            <div className={`text-sm break-all ${c.mono?"font-mono":""}`} style={{ color: c.color || "#e5e7eb" }}>{c.value}</div>
           </div>
-          {apiKeyLocked && maskedKey && <div className="text-xs text-gray-600 mt-1 font-mono">Server key: {maskedKey}</div>}
-          <div className="text-xs text-gray-600 mt-1">Direct browser checks on <span className="font-mono text-blue-400">/api/health</span> need the API key in the header or query string. Use <span className="font-mono text-cyan-300">/api/public/health</span> for a public check.</div>
-          {backendUrl && (
-            <div className="mt-2 grid grid-cols-1 gap-1.5 text-[11px] font-mono">
-              <div className="rounded-lg border border-gray-800 bg-black/30 px-2.5 py-1.5 text-gray-400 break-all">Public check: <span className="text-cyan-300">{`${backendUrl}/api/public/health`}</span></div>
-              {apiKey && <div className="rounded-lg border border-gray-800 bg-black/30 px-2.5 py-1.5 text-gray-400 break-all">Authorized browser check: <span className="text-green-300">{`${backendUrl}/api/health?key=${encodeURIComponent(apiKey)}`}</span></div>}
-            </div>
-          )}
-          {!apiKey && <div className="text-xs text-yellow-500/70 mt-1">First run? Check backend console for the auto-generated key: <span className="font-mono">node server.js</span></div>}
-        </div>
+        ))}
       </div>
+      {trusted===false && !apiKey && (
+        <div className="text-xs text-yellow-500/80 bg-yellow-900/10 rounded-lg px-3 py-2 border border-yellow-900/20">
+          This device is not on the server's trusted list (<span className="font-mono">SV_TRUSTED_NETS</span>). Open Advanced and paste the API key, or ask the administrator to add this device.
+        </div>
+      )}
       <div className="flex gap-2 items-center flex-wrap">
         <button onClick={testAPI} disabled={verifying}
           className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition-all disabled:opacity-50">
@@ -1195,15 +1187,49 @@ function SnortAPIPanel({ backendUrl, setBackendUrl, apiKey, setApiKey, status, s
             <Unlink size={12}/>Disconnect
           </button>
         )}
-        {verifyResult && (
-          <div className={`flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border ${
-            verifyResult.ok?"text-green-400 bg-green-900/10 border-green-900/40":"text-red-400 bg-red-900/10 border-red-900/40"
-          }`}>
-            <ActionStatePill type={verifyResult.ok?"OK":"ERR"} msg={verifyResult.msg}/>
-            <span>{verifyResult.msg}</span>
-          </div>
-        )}
+        <button onClick={()=>setShowManual(p=>!p)} className="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-800 text-gray-500 hover:text-gray-300 text-xs font-bold transition-all">
+          <Key size={12}/>{showManual?"Hide advanced":"Advanced"}
+        </button>
       </div>
+      {verifyResult && (
+        <div className={`flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border ${
+          verifyResult.ok?"text-green-400 bg-green-900/10 border-green-900/40":"text-red-400 bg-red-900/10 border-red-900/40"
+        }`}>
+          <ActionStatePill type={verifyResult.ok?"OK":"ERR"} msg={verifyResult.msg}/>
+          <span>{verifyResult.msg}</span>
+        </div>
+      )}
+      {showManual && (
+        <div className="rounded-lg border border-gray-800 bg-black/30 p-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs text-gray-500 mb-1 block">Backend URL</label>
+            <input value={backendUrl} onChange={e=>setBackendUrl(e.target.value)} placeholder={window.location.origin}
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
+            <div className="text-xs text-gray-600 mt-1">Leave it on this site's address unless the backend runs elsewhere.</div>
+          </div>
+          <div>
+            <label className="text-xs text-gray-500 mb-1 block flex items-center gap-1.5">
+              API Key
+              {apiKeyLocked && <span className="text-yellow-500 flex items-center gap-0.5"><Lock size={9}/>set by the server</span>}
+            </label>
+            <div className="relative">
+              <input value={apiKey} onChange={apiKeyLocked?undefined:e=>setApiKey(e.target.value.trim())}
+                readOnly={apiKeyLocked} type={showApiKey?"text":"password"} placeholder="Paste the key from an administrator"
+                className={`w-full bg-gray-900 border rounded-lg px-3 py-2 pr-16 text-sm text-white font-mono focus:outline-none ${
+                  apiKeyLocked?"border-yellow-900/50 cursor-default opacity-80":"border-gray-700 focus:border-blue-500"}`}/>
+              <div className="absolute right-1.5 top-1.5 flex items-center gap-1">
+                <button onClick={copyKey} title="Copy key" className="text-gray-600 hover:text-gray-300 p-1">
+                  {copied?<Check size={13} className="text-green-400"/>:<Copy size={13}/>}
+                </button>
+                <button onClick={()=>setShowApiKey(p=>!p)} className="text-gray-600 hover:text-gray-300 p-1">
+                  {showApiKey?<EyeOff size={13}/>:<Eye size={13}/>}
+                </button>
+              </div>
+            </div>
+            <div className="text-xs text-gray-600 mt-1">The key is kept only in this browser. Public health check: <span className="font-mono text-cyan-300">/api/public/health</span></div>
+          </div>
+        </div>
+      )}
       {/* Oinkcode */}
       <div className="rounded-lg border border-gray-800 bg-black/30 p-3 space-y-2">
         <div className="flex items-center gap-2">
@@ -1245,36 +1271,34 @@ function SnortAPIPanel({ backendUrl, setBackendUrl, apiKey, setApiKey, status, s
   );
 }
 
-// ─── v0.1: Database Connection Panel (separate from API) ──────────────────────
+// ─── Database panel: what the backend actually stores, and for how long ──────
 function DatabasePanel({ backendUrl, apiKey, backendStatus, dbStatus, setDbStatus }) {
-  const [dbForm,setDbForm] = useState(()=>loadSaved("dbForm",{ host:"127.0.0.1", port:"3306", user:"snortvision", pass:"", dbName:"snortvision", type:"sqlite" }));
-  const [showPass,setShowPass]   = useState(false);
-  const [dbResult,setDbResult]   = useState(null);
-  const [dbStats,setDbStats]     = useState(null);
+  const [stats,setStats] = useState(null);
+  const [error,setError] = useState("");
 
-  // Persist DB form
-  useEffect(()=>{ saveSetting("dbForm",{...dbForm,pass:""}); },[dbForm]);
+  // Old builds kept a MySQL form (with password) in browser storage; drop it.
+  useEffect(()=>{ try { localStorage.removeItem("sv_dbForm"); } catch {} },[]);
 
-  const testDB = async () => {
-    setDbStatus("connecting"); setDbResult(null);
+  const load = async () => {
+    if(backendStatus!=="connected" || !apiKey) return;
     try {
-      if(backendStatus==="connected") {
-        const res = await fetch(`${backendUrl}/api/health`,{ headers: apiKey ? {"X-API-Key":apiKey} : {} });
-        if(!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        setDbStatus("connected"); setDbStats(data);
-        setDbResult({ok:true,msg:`Database reachable — ${data.alerts_total||0} alerts, ${data.db_size||"unknown"} size`});
-      } else { throw new Error("Connect Snort API first to verify database"); }
-    } catch(e) { setDbStatus("error"); setDbResult({ok:false,msg:e.message}); }
+      const r = await fetch(`${backendUrl}/api/db/stats`,{ headers:{ "X-API-Key":apiKey } });
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      setStats(await r.json()); setError(""); setDbStatus("connected");
+    } catch(e) { setError(e.message); setDbStatus("error"); }
   };
-  const disconnect = () => { setDbStatus("idle"); setDbResult(null); setDbStats(null); };
+  useEffect(()=>{ load(); const iv=setInterval(load,30000); return ()=>clearInterval(iv); },[backendStatus, backendUrl, apiKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fmtTs = ts => ts ? new Date(ts).toLocaleString() : "—";
+  const fmtMb = b => b!=null ? `${(b/1024/1024).toFixed(1)} MB` : "—";
+  const pct = stats?.maxAlerts ? Math.min(100, (stats.count||0)/stats.maxAlerts*100) : 0;
 
   return (
     <div className="rounded-xl border border-gray-800 bg-gray-950 p-4 space-y-4">
       <div className="flex items-center gap-2">
         <HardDrive size={14} className="text-purple-400"/>
-        <span className="text-sm font-bold text-white">Database Connection</span>
-        <span className="text-xs text-gray-600 ml-1">alert persistence</span>
+        <span className="text-sm font-bold text-white">Database</span>
+        <span className="text-xs text-gray-600 ml-1">{stats?.engine || "SQLite"} on the backend — nothing to configure</span>
         <div style={{
           background:dbStatus==="connected"?"rgba(48,209,88,0.1)":dbStatus==="error"?"rgba(255,45,85,0.1)":"rgba(110,118,129,0.1)",
           color:dbStatus==="connected"?"#30d158":dbStatus==="error"?"#ff2d55":"#6e7681",
@@ -1284,77 +1308,34 @@ function DatabasePanel({ backendUrl, apiKey, backendStatus, dbStatus, setDbStatu
           {dbStatus.toUpperCase()}
         </div>
       </div>
-      <div className="flex gap-2">
-        {["sqlite","mysql"].map(t=>(
-          <button key={t} onClick={()=>setDbForm(p=>({...p,type:t}))}
-            className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all font-mono ${
-              dbForm.type===t?"bg-purple-600 border-purple-600 text-white":"border-gray-700 text-gray-400 hover:border-gray-500"}`}>{t.toUpperCase()}</button>
-        ))}
-      </div>
-      {dbForm.type==="mysql" && (
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-          {[{k:"host",label:"DB Host",ph:"127.0.0.1"},{k:"port",label:"Port",ph:"3306"},{k:"dbName",label:"Database",ph:"snortvision"}].map(f=>(
-            <div key={f.k}>
-              <label className="text-xs text-gray-500 mb-1 block">{f.label}</label>
-              <input value={dbForm[f.k]} onChange={e=>setDbForm(p=>({...p,[f.k]:e.target.value}))} placeholder={f.ph}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-            </div>
-          ))}
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">DB User</label>
-            <div className="relative">
-              <User size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={dbForm.user} onChange={e=>setDbForm(p=>({...p,user:e.target.value}))} placeholder="snortvision"
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-            </div>
+      {backendStatus!=="connected" && <div className="text-xs text-gray-500">Connect the Snort API above to see the database.</div>}
+      {error && <div className="text-xs text-red-400 font-mono">{error}</div>}
+      {stats && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {[{label:"Alerts stored",val:(stats.count||0).toLocaleString(),color:"#ff2d55"},
+              {label:"Kept for",val:`${stats.retentionDays||"—"} days`,color:"#0a84ff"},
+              {label:"Oldest alert",val:fmtTs(stats.oldest),color:"#8e8e93",small:true},
+              {label:"Size on disk",val:fmtMb(stats.dbSizeBytes),color:"#30d158"},
+            ].map(c=>(
+              <div key={c.label} style={{borderColor:`${c.color}25`,background:`${c.color}08`}} className="rounded-lg border p-2.5">
+                <div style={{color:c.color}} className={`${c.small?"text-sm":"text-lg"} font-black font-mono`}>{c.val}</div>
+                <div className="text-xs text-gray-500 mt-0.5">{c.label}</div>
+              </div>
+            ))}
           </div>
           <div>
-            <label className="text-xs text-gray-500 mb-1 block">DB Password</label>
-            <div className="relative">
-              <Lock size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={dbForm.pass} onChange={e=>setDbForm(p=>({...p,pass:e.target.value}))} type={showPass?"text":"password"} placeholder="••••••••"
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-9 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-              <button onClick={()=>setShowPass(p=>!p)} className="absolute right-2.5 top-2.5 text-gray-600 hover:text-gray-300">{showPass?<EyeOff size={14}/>:<Eye size={14}/>}</button>
+            <div className="flex justify-between text-xs text-gray-500 mb-1">
+              <span>Safety cap</span>
+              <span className="font-mono">{(stats.count||0).toLocaleString()} / {(stats.maxAlerts||0).toLocaleString()}</span>
             </div>
-          </div>
-        </div>
-      )}
-      {dbForm.type==="sqlite" && (
-        <div className="text-xs text-gray-500 bg-gray-900/50 rounded-lg px-3 py-2 font-mono">
-          SQLite database at <span className="text-blue-400">/app/data/snortvision.db</span> — managed by backend
-        </div>
-      )}
-      {dbStats && dbStatus==="connected" && (
-        <div className="grid grid-cols-4 gap-2">
-          {[{label:"Alerts",val:dbStats.alerts_total||0,color:"#ff2d55"},{label:"Blocklist",val:dbStats.blocklist_count||0,color:"#ff9f0a"},
-            {label:"Rules",val:dbStats.rules_count||0,color:"#0a84ff"},{label:"DB size",val:dbStats.db_size||"—",color:"#30d158"}
-          ].map(s=>(
-            <div key={s.label} style={{borderColor:`${s.color}20`,background:`${s.color}06`}} className="rounded-lg border p-2.5 text-center">
-              <div style={{color:s.color}} className="text-lg font-black font-mono">{typeof s.val==="number"?s.val.toLocaleString():s.val}</div>
-              <div className="text-xs text-gray-500 mt-0.5">{s.label}</div>
+            <div className="h-1.5 rounded-full bg-gray-900 overflow-hidden">
+              <div style={{ width:`${pct}%`, background: pct>90?"#ff2d55":pct>70?"#ffd60a":"#bf5af2" }} className="h-full"/>
             </div>
-          ))}
-        </div>
-      )}
-      <div className="flex gap-2 items-center flex-wrap">
-        <button onClick={testDB} disabled={dbStatus==="connecting"}
-          className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold transition-all disabled:opacity-50 ${
-            dbStatus==="connected"?"bg-green-700 hover:bg-green-600 text-white":"bg-purple-600 hover:bg-purple-500 text-white"}`}>
-          {dbStatus==="connecting"?<><Loader2 size={12} className="animate-spin"/>Testing…</>:
-           dbStatus==="connected"?<><CheckCircle2 size={12}/>Connected</>:<><Database size={12}/>Test DB Connection</>}
-        </button>
-        {dbStatus==="connected" && (
-          <button onClick={disconnect} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-700 text-gray-400 hover:border-red-700 hover:text-red-400 text-xs font-bold transition-all">
-            <Unlink size={12}/>Disconnect
-          </button>
-        )}
-        {dbResult && (
-          <div className={`flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded-lg border ${
-            dbResult.ok?"text-green-400 bg-green-900/10 border-green-900/40":"text-red-400 bg-red-900/10 border-red-900/40"}`}>
-            {dbResult.ok?<CheckCircle2 size={12}/>:<XCircle size={12}/>}{dbResult.msg}
+            <div className="text-xs text-gray-600 mt-1.5">Alerts older than {stats.retentionDays} days are removed automatically; the cap only applies if a flood fills the database first. File: <span className="font-mono">{stats.path}</span></div>
           </div>
-        )}
-      </div>
+        </>
+      )}
     </div>
   );
 }
@@ -3045,27 +3026,76 @@ function Notifications() {
 }
 
 // ─── CONNECTION ───────────────────────────────────────────────────────────────
+// Router platforms SnortVision can talk to. The server sends its own copy
+// (router.platforms); this one is the fallback before it answers.
+const ROUTER_PLATFORMS_UI = [
+  { id:"OPNsense", label:"OPNsense", transport:"api", canEnforce:false,
+    hint:"Reads the router through its REST API with a key pair. Create a user with only read privileges (Lobby: Dashboard, Reporting: Traffic, Diagnostics: Netstat, Diagnostics: Firewall statistics) and an API key for it." },
+  { id:"pfSense", label:"pfSense", transport:"ssh", canEnforce:false,
+    hint:"Reads the router over SSH with FreeBSD commands (hostname, ifconfig, netstat). Nothing is changed on the router." },
+  { id:"OpenWRT", label:"OpenWrt", transport:"ssh", canEnforce:true,
+    hint:"Reads the router over SSH (ubus, uci). If read-only is turned off, blocks are added to an nftables set on the router." },
+  { id:"Generic Router/Linux", label:"Linux router", transport:"ssh", canEnforce:true,
+    hint:"Any Linux box that routes traffic, over SSH. If read-only is turned off, blocks are added with iptables." },
+];
+
+function SummaryRow({ label, children, mono }) {
+  return (
+    <div className="flex gap-3 py-1.5 border-b border-gray-900 last:border-0 text-sm">
+      <span className="w-36 flex-shrink-0 text-xs text-gray-500 pt-0.5">{label}</span>
+      <span className={`text-gray-200 break-all ${mono?"font-mono":""}`}>{children}</span>
+    </div>
+  );
+}
+
+function FieldInput({ label, icon:Icon, value, onChange, placeholder, type="text", focus="blue", right }) {
+  return (
+    <div>
+      <label className="text-xs text-gray-500 mb-1 block">{label}</label>
+      <div className="relative">
+        {Icon && <Icon size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>}
+        <input value={value||""} type={type} placeholder={placeholder} onChange={e=>onChange(e.target.value)} autoComplete="off"
+          className={`w-full bg-gray-900 border border-gray-700 rounded-lg ${Icon?"pl-8":"pl-3"} ${right?"pr-9":"pr-3"} py-2 text-sm text-white font-mono focus:outline-none ${focus==="cyan"?"focus:border-cyan-500":"focus:border-blue-500"}`}/>
+        {right}
+      </div>
+    </div>
+  );
+}
+
 function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUrl, apiKey, setApiKey, backendStatus, setBackendStatus, backendStats, setBackendStats, sshStatus, setSshStatus, snortStatus, setSnortStatus, dbStatus, setDbStatus, routerStatus, setRouterStatus }) {
   const [form,setForm] = useState({...host});
   const [routerForm,setRouterForm] = useState({...router});
   const [showSshPass,setShowSshPass] = useState(false);
   const [showRouterPass,setShowRouterPass] = useState(false);
   const [routerBusy,setRouterBusy] = useState(false);
+  const [editSensor,setEditSensor] = useState(false);
+  const [editRouter,setEditRouter] = useState(false);
 
   useEffect(()=>{ setForm({...host}); },[host]);
   useEffect(()=>{ setRouterForm({...router}); },[router]);
+  // Nothing configured yet: open the forms straight away.
+  useEffect(()=>{ if(!host.ip) setEditSensor(true); },[host.ip]);
+  useEffect(()=>{ if(!router.ip) setEditRouter(true); },[router.ip]);
+
+  const platforms = ROUTER_PLATFORMS_UI.map(p=>({ ...p, ...(router.platforms?.[p.id]||{}) }));
+  const platformOf = id => platforms.find(p=>p.id===id) || platforms[platforms.length-1];
+  const formPlatform = platformOf(routerForm.routerType || "OPNsense");
+  const savedPlatform = platformOf(router.routerType || "OPNsense");
 
   const connectSSH = async () => {
     if(!form.ip) { setSshStatus("error"); return; }
     setSshStatus("connecting");
     setSnortStatus("checking");
+    // Empty password fields mean "keep what the server already has".
+    const payload = {
+      ip: form.ip, port: form.port || "22", user: form.user || "snort",
+      password: form.sshPass || "", sudoPassword: form.sudoPass || "", authMode: form.authMode || "SSH Key",
+      logPath: form.logPath || "/var/log/snort/alert_json.txt",
+      keyPath: "/app/keys/snort_id_rsa",
+    };
+    const saved = { ip:payload.ip, port:payload.port, user:payload.user, authMode:payload.authMode, logPath:payload.logPath, keyPath:payload.keyPath,
+      sshPass:"", sudoPass:"", hasPassword: host.hasPassword || !!form.sshPass, hasSudoPassword: host.hasSudoPassword || !!form.sudoPass };
     try {
-      const payload = {
-        ip: form.ip, port: form.port || "22", user: form.user || "snort",
-        password: form.sshPass || "", sudoPassword: form.sudoPass || "", authMode: form.authMode || "SSH Key",
-        logPath: form.logPath || "/var/log/snort/alert_json.txt",
-        keyPath: "/app/keys/snort_id_rsa",
-      };
       const res = await fetch(`${backendUrl}/api/config/connection`,{
         method:"POST",
         headers:{"Content-Type":"application/json",...(apiKey?{"X-API-Key":apiKey}:{})},
@@ -3075,30 +3105,27 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
       if(data.ok) {
         setSshStatus("connected");
         setSnortStatus("running");
-        setHost({...form,...payload,connected:true,lastError:""});
+        setHost({...host,...saved,connected:true,lastError:""});
+        setEditSensor(false);
       } else {
         setSshStatus("error");
         setSnortStatus("down");
-        setHost({...form,...payload,connected:false,lastError:data.message||"Connection failed"});
+        setHost({...host,...saved,connected:false,lastError:data.message||"Connection failed"});
       }
     } catch(e) {
       setSshStatus("error");
       setSnortStatus("down");
-      setHost({...form,connected:false,lastError:e.message});
+      setHost({...host,...saved,connected:false,lastError:e.message});
     }
-  };
-
-  const disconnectSSH = () => {
-    setSshStatus("idle");
-    setSnortStatus("idle");
-    setHost({...form,connected:false});
   };
 
   const saveRouterState = (nextForm, data = {}) => {
     const next = {
       ...nextForm,
+      sshPass:"", apiKey:"", apiSecret:"",
       connected: !!data.ok,
       routerInfo: data.info || nextForm.routerInfo || null,
+      apiCertSha256: data.info?.certificateSha256 || nextForm.apiCertSha256 || "",
       lastError: data.ok ? "" : (data.message || nextForm.lastError || ""),
       lastMessage: data.message || "",
     };
@@ -3106,26 +3133,32 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
     setRouterForm(next);
   };
 
-  const connectRouter = async () => {
+  const connectRouter = async (extra = {}) => {
     if(!routerForm.ip) {
       setRouterStatus("error");
-      saveRouterState(routerForm, { ok:false, message:"Main router IP is required" });
+      saveRouterState(routerForm, { ok:false, message:"Router address is required" });
       return;
     }
     setRouterBusy(true);
     setRouterStatus("connecting");
+    const p = formPlatform;
     try {
       const payload = {
+        routerType: p.id,
         ip: routerForm.ip,
         port: routerForm.port || "22",
         user: routerForm.user || "root",
         password: routerForm.sshPass || "",
-        authMode: routerForm.authMode || "Password",
+        authMode: routerForm.authMode || "SSH Key",
         keyPath: "/app/keys/router_id_rsa",
-        routerType: routerForm.routerType || "OpenWRT",
+        apiPort: routerForm.apiPort || "443",
+        apiKey: routerForm.apiKey || "",
+        apiSecret: routerForm.apiSecret || "",
         monitorInterface: routerForm.monitorInterface || "",
-        mirrorTarget: routerForm.mirrorTarget || "",
+        mirrorTarget: p.id==="OpenWRT" ? (routerForm.mirrorTarget || "") : "",
+        readOnly: p.canEnforce ? routerForm.readOnly !== false : true,
         note: routerForm.note || "",
+        ...extra,
       };
       const res = await fetch(`${backendUrl}/api/config/router`,{
         method:"POST",
@@ -3134,7 +3167,14 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
       });
       const data = await res.json();
       setRouterStatus(data.ok ? "connected" : "error");
-      saveRouterState({...routerForm,...payload}, data);
+      const has = {
+        hasPassword: router.hasPassword || !!routerForm.sshPass,
+        hasApiKey: router.hasApiKey || !!routerForm.apiKey,
+        hasApiSecret: router.hasApiSecret || !!routerForm.apiSecret,
+      };
+      const { repinCertificate, ...kept } = payload;
+      saveRouterState({ ...routerForm, ...kept, ...has, apiCertSha256: extra.repinCertificate ? "" : routerForm.apiCertSha256 }, data);
+      if(data.ok) setEditRouter(false);
     } catch(e) {
       setRouterStatus("error");
       saveRouterState(routerForm, { ok:false, message:e.message });
@@ -3144,48 +3184,48 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
   };
 
   const refreshRouter = async () => {
-    if(!routerForm.ip) return;
+    if(!router.ip) return;
     setRouterBusy(true);
     try {
       const res = await fetch(`${backendUrl}/api/router/info`,{ headers: apiKey ? {"X-API-Key":apiKey} : {} });
       const data = await res.json();
       setRouterStatus(data.ok ? "connected" : "error");
-      saveRouterState(routerForm, data);
+      saveRouterState(router, { ...data, message: data.ok ? "Router information refreshed" : (data.info?.error || data.message) });
     } catch(e) {
       setRouterStatus("error");
-      saveRouterState(routerForm, { ok:false, message:e.message });
+      saveRouterState(router, { ok:false, message:e.message });
     } finally {
       setRouterBusy(false);
     }
-  };
-
-  const disconnectRouter = () => {
-    setRouterStatus("idle");
-    setRouter({...routerForm,connected:false,routerInfo:null,lastError:"",lastMessage:""});
   };
 
   const effectiveBackend = sshStatus==="error"||sshStatus==="down" ? "degraded" : backendStatus;
   const effectiveDb      = sshStatus==="error"||sshStatus==="down" ? "down" : dbStatus;
   const effectiveSnort   = sshStatus==="error"||sshStatus==="down" ? "down" : snortStatus;
   const routerInfo = router.routerInfo || null;
-  const routerIdentifier = routerInfo?.hostname || routerForm.ip || "main-router";
+  const routerIdentifier = routerInfo?.hostname || router.ip || "router";
+  const routerReadOnly = !savedPlatform.canEnforce || router.readOnly !== false;
 
   const infoCards = [
-    { label:"Main router reachable", value: routerInfo ? (routerInfo.reachable ? "yes" : "no") : "—" },
     { label:"Hostname", value: routerInfo?.hostname || "not detected", mono:true },
-    { label:"Firmware version", value: routerInfo?.firmwareVersion || "not detected" },
+    { label:"Firmware", value: routerInfo?.firmwareVersion || "not detected" },
     { label:"WAN IP", value: routerInfo?.wanIp || "not detected", mono:true },
     { label:"LAN IP", value: routerInfo?.lanIp || "not detected", mono:true },
-    { label:"Monitored interface", value: routerInfo?.monitoredInterface || routerForm.monitorInterface || "not set", mono:true },
-    { label:"Bridge / interfaces", value: routerInfo?.bridgeNames || routerInfo?.lanBridge || "not detected", mono:true },
-    { label:"Firewall zones", value: routerInfo?.firewallZones || "not detected", mono:true },
-    { label:"Mirror / SPAN target", value: routerInfo?.mirrorSpanTarget || routerForm.mirrorTarget || "not detected", mono:true },
-    { label:"tcpdump test", value: routerInfo?.tcpdump || "not tested", mono:true },
+    { label:"Monitored interface", value: routerInfo?.monitoredInterface || router.monitorInterface || "not set", mono:true },
+    { label:"Interfaces", value: routerInfo?.bridgeNames || "not detected", mono:true },
     { label:"Packet counters", value: routerInfo?.packetCounters || "not available", mono:true },
-    { label:"Candidate interfaces", value: routerInfo?.candidateInterfaces || "not detected", mono:true },
-    { label:"Snort / Suricata packages", value: routerInfo?.packages || "not detected", mono:true },
+    { label:"Firewall", value: routerInfo?.packages || routerInfo?.firewallZones || "not detected", mono:true },
     { label:"Latency", value: routerInfo?.latencyMs != null ? `${routerInfo.latencyMs} ms` : "not measured", mono:true },
   ];
+
+  const statusPill = (state, label) => (
+    <span className="ml-auto flex items-center gap-1.5 text-xs font-mono" style={{ color: state==="connected" ? "#30d158" : state==="error" ? "#ff2d55" : "#6e7681" }}>
+      {state==="connected" ? <CheckCircle2 size={12}/> : state==="error" ? <XCircle size={12}/> : <span style={{width:6,height:6,borderRadius:"50%",background:"currentColor",display:"inline-block"}}/>}
+      {label}
+    </span>
+  );
+
+  const secretHint = (has, what) => has ? `stored on the server — leave empty to keep` : `not set — ${what}`;
 
   return (
     <div className="max-w-5xl space-y-4">
@@ -3206,9 +3246,9 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
       <div id="sec-backend" style={{ scrollMarginTop:64 }}/>
 
       <div className="rounded-xl border border-cyan-900/30 bg-cyan-950/10 p-4 text-sm text-cyan-100 space-y-2">
-        <div className="font-bold flex items-center gap-2"><Radio size={14} className="text-cyan-400"/>Traffic source model</div>
+        <div className="font-bold flex items-center gap-2"><Radio size={14} className="text-cyan-400"/>How the pieces fit</div>
         <div className="text-cyan-100/80 text-xs leading-5">
-          SnortVision still reads alerts from the <span className="text-white font-semibold">Snort sensor</span>. The main router box below is an optional <span className="text-white font-semibold">management target</span> for OpenWRT, another router platform, or any SSH-accessible edge device. When no dedicated sensor interface is configured, the backend can now fall back to the main router interface counters so the dashboard shows real edge traffic instead of staying blind.
+          Alerts come from the <span className="text-white font-semibold">Snort sensor</span>. The <span className="text-white font-semibold">router</span> is optional: SnortVision reads its name, interfaces and traffic counters, and only changes it if you turn read-only off on a platform that supports blocking. All passwords and keys are kept on the server, never in this browser.
         </div>
       </div>
 
@@ -3218,91 +3258,82 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
         status={backendStatus} setStatus={setBackendStatus}
         dbStats={backendStats} setDbStats={setBackendStats}/>
 
+      {/* ── Snort sensor ─────────────────────────────────────────── */}
       <div id="sec-sensor" className="rounded-xl border border-gray-800 bg-gray-950 p-5 space-y-3" style={{ scrollMarginTop:64 }}>
         <div className="flex items-center gap-2">
           <Terminal size={14} className="text-green-400"/>
-          <span className="font-bold text-white">Snort Sensor — Alert Source & SSH</span>
-          {sshStatus==="connected" && <span className="ml-auto flex items-center gap-1.5 text-xs text-green-400 font-mono"><CheckCircle2 size={12}/>CONNECTED</span>}
+          <span className="font-bold text-white">Snort Sensor</span>
+          <span className="text-xs text-gray-600">alert source</span>
+          {statusPill(sshStatus, sshStatus==="connected" ? "CONNECTED" : sshStatus==="error" ? "ERROR" : sshStatus.toUpperCase())}
         </div>
-        <div className="text-xs text-gray-500">This is the host that runs Snort3 and produces the alert log consumed by the GUI.</div>
-        {backendStatus!=="connected" && (
-          <div className="text-xs text-yellow-500/80 bg-yellow-900/10 rounded-lg px-3 py-2 border border-yellow-900/20 flex items-center gap-1.5">
-            <AlertTriangle size={11}/>Connect the Snort API above first — SSH goes through the backend.
-          </div>
+
+        {!editSensor ? (
+          <>
+            <div className="rounded-lg border border-gray-800 bg-black/30 px-3 py-1">
+              <SummaryRow label="Host" mono>{host.user || "snort"}@{host.ip}:{host.port || "22"}</SummaryRow>
+              <SummaryRow label="Sign-in">{host.authMode==="Password" ? (host.hasPassword ? "Password stored on the server" : "Password not set") : "SSH key on the server (/app/keys/snort_id_rsa)"}</SummaryRow>
+              <SummaryRow label="Sudo">{host.hasSudoPassword ? "Password stored on the server" : "Passwordless sudo or not needed"}</SummaryRow>
+              <SummaryRow label="Alert log" mono>{host.logPath || "/var/log/snort/alert_json.txt"}</SummaryRow>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={connectSSH} disabled={sshStatus==="connecting" || backendStatus!=="connected"}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition-all disabled:opacity-40">
+                {sshStatus==="connecting"?<><RefreshCw size={12} className="animate-spin"/>Connecting…</>:<><RefreshCw size={12}/>Reconnect</>}
+              </button>
+              <button onClick={()=>setEditSensor(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-700 text-gray-300 hover:border-blue-500 text-xs font-bold transition-all">
+                <Edit3 size={12}/>Edit
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="text-xs text-gray-500">The host that runs Snort3 and writes the JSON alert log.</div>
+            {backendStatus!=="connected" && (
+              <div className="text-xs text-yellow-500/80 bg-yellow-900/10 rounded-lg px-3 py-2 border border-yellow-900/20 flex items-center gap-1.5">
+                <AlertTriangle size={11}/>Connect the Snort API above first — SSH goes through the backend.
+              </div>
+            )}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <FieldInput label="Sensor address" icon={Globe} value={form.ip} placeholder="192.168.1.50" onChange={v=>setForm(p=>({...p,ip:v}))}/>
+              <FieldInput label="SSH port" icon={Hash} value={form.port} placeholder="22" onChange={v=>setForm(p=>({...p,port:v}))}/>
+              <FieldInput label="SSH user" icon={User} value={form.user} placeholder="snort3" onChange={v=>setForm(p=>({...p,user:v}))}/>
+              <FieldInput label="Alert log path" icon={FileText} value={form.logPath} placeholder="/var/log/snort/alert_json.txt" onChange={v=>setForm(p=>({...p,logPath:v}))}/>
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              {["SSH Key","Password"].map(m=>(
+                <button key={m} onClick={()=>setForm(p=>({...p,authMode:m}))}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${form.authMode===m?"bg-blue-600 border-blue-600 text-white":"border-gray-700 text-gray-400 hover:border-gray-500"}`}>
+                  {m==="SSH Key"?<span className="flex items-center gap-1.5"><Key size={11}/>{m}</span>:<span className="flex items-center gap-1.5"><Lock size={11}/>{m}</span>}
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {form.authMode==="Password" ? (
+                <FieldInput label="SSH password" icon={Lock} type={showSshPass?"text":"password"} value={form.sshPass}
+                  placeholder={secretHint(host.hasPassword,"type it to save")} onChange={v=>setForm(p=>({...p,sshPass:v}))}
+                  right={<button onClick={()=>setShowSshPass(p=>!p)} className="absolute right-2.5 top-2.5 text-gray-600 hover:text-gray-300">{showSshPass?<EyeOff size={14}/>:<Eye size={14}/>}</button>}/>
+              ) : (
+                <div className="text-xs text-gray-500 bg-gray-900/50 rounded-lg px-3 py-2 self-end">
+                  The backend signs in with <span className="font-mono text-blue-400">/app/keys/snort_id_rsa</span>; its public key must be in the sensor user's <span className="font-mono">authorized_keys</span>.
+                </div>
+              )}
+              <FieldInput label="Sudo password (only for Snort start/stop)" icon={Shield} type={showSshPass?"text":"password"} value={form.sudoPass}
+                placeholder={secretHint(host.hasSudoPassword,"optional")} onChange={v=>setForm(p=>({...p,sudoPass:v}))}/>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={connectSSH} disabled={sshStatus==="connecting"}
+                className={`flex-1 py-2.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
+                  sshStatus==="connecting"?"bg-gray-700 text-gray-400 cursor-wait":"bg-blue-600 hover:bg-blue-500 text-white"}`}>
+                {sshStatus==="connecting"?<><RefreshCw size={14} className="animate-spin"/>Connecting…</>:<><Wifi size={14}/>Save and connect</>}
+              </button>
+              {host.ip && (
+                <button onClick={()=>{ setForm({...host}); setEditSensor(false); }} className="px-4 py-2.5 rounded-xl border border-gray-700 text-gray-400 hover:text-gray-200 text-sm font-bold transition-all">
+                  Cancel
+                </button>
+              )}
+            </div>
+          </>
         )}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Sensor IP</label>
-            <div className="relative"><Globe size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={form.ip||""} placeholder="192.168.1.72" onChange={e=>setForm(p=>({...p,ip:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">SSH Port</label>
-            <div className="relative"><Hash size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={form.port||""} placeholder="22" onChange={e=>setForm(p=>({...p,port:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">SSH User</label>
-            <div className="relative"><User size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={form.user||""} placeholder="snort3" onChange={e=>setForm(p=>({...p,user:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">SSH Password</label>
-            <div className="relative"><Lock size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={form.sshPass||""} type={showSshPass?"text":"password"} placeholder="••••••••" onChange={e=>setForm(p=>({...p,sshPass:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-9 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-              <button onClick={()=>setShowSshPass(p=>!p)} className="absolute right-2.5 top-2.5 text-gray-600 hover:text-gray-300">{showSshPass?<EyeOff size={14}/>:<Eye size={14}/>}</button>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Sudo Password</label>
-            <div className="relative"><Shield size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={form.sudoPass||""} type={showSshPass?"text":"password"} placeholder="optional — used for service control" onChange={e=>setForm(p=>({...p,sudoPass:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-            </div>
-          </div>
-        </div>
-        <div>
-          <label className="text-xs text-gray-500 mb-1 block">Alert Log Path</label>
-          <div className="relative"><FileText size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-            <input value={form.logPath||""} placeholder="/var/log/snort/alert_json.txt" onChange={e=>setForm(p=>({...p,logPath:e.target.value}))}
-              className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-blue-500"/>
-          </div>
-        </div>
-        <div className="flex gap-2 flex-wrap">
-          {["SSH Key","Password"].map(m=>(
-            <button key={m} onClick={()=>setForm(p=>({...p,authMode:m}))}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${form.authMode===m?"bg-blue-600 border-blue-600 text-white":"border-gray-700 text-gray-400 hover:border-gray-500"}`}>
-              {m==="SSH Key"?<span className="flex items-center gap-1.5"><Key size={11}/>{m}</span>:<span className="flex items-center gap-1.5"><Lock size={11}/>{m}</span>}
-            </button>
-          ))}
-        </div>
-        <div className="text-xs text-gray-500 bg-gray-900/50 rounded-lg px-3 py-2">
-          Use <span className="text-white font-semibold">SSH Password</span> for SSH login when auth mode is Password. Use <span className="text-white font-semibold">Sudo Password</span> when the SSH user can connect but still needs <span className="font-mono text-cyan-300">sudo</span> for Snort3 status/restart.
-        </div>
-        {form.authMode==="SSH Key" && (
-          <div className="text-xs text-gray-500 bg-gray-900/50 rounded-lg px-3 py-2 font-mono">
-            Sensor SSH key path: <span className="text-blue-400">/app/keys/snort_id_rsa</span>
-          </div>
-        )}
-        <div className="flex gap-2">
-          <button onClick={connectSSH} disabled={sshStatus==="connecting"}
-            className={`flex-1 py-2.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
-              sshStatus==="connected"?"bg-green-600 text-white":sshStatus==="connecting"?"bg-gray-700 text-gray-400 cursor-wait":"bg-blue-600 hover:bg-blue-500 text-white"}`}>
-            {sshStatus==="connected"?<><Check size={14}/>Connected to {form.ip}</>:sshStatus==="connecting"?<><RefreshCw size={14} className="animate-spin"/>Connecting…</>:<><Wifi size={14}/>Connect Sensor</>}
-          </button>
-          {sshStatus==="connected" && (
-            <button onClick={disconnectSSH} className="px-4 py-2.5 rounded-xl border border-gray-700 text-gray-400 hover:border-red-700 hover:text-red-400 text-sm font-bold transition-all flex items-center gap-1.5">
-              <Unlink size={14}/>Disconnect
-            </button>
-          )}
-        </div>
         {sshStatus==="error" && host.lastError && (
           <div className="flex items-center gap-2 text-xs text-red-400 bg-red-900/10 rounded-lg px-3 py-2 border border-red-900/30">
             <XCircle size={12} className="flex-shrink-0"/>
@@ -3311,101 +3342,143 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
         )}
       </div>
 
+      {/* ── Router ───────────────────────────────────────────────── */}
       <div id="sec-router" className="rounded-xl border border-gray-800 bg-gray-950 p-5 space-y-4" style={{ scrollMarginTop:64 }}>
         <div className="flex items-center gap-2">
           <Server size={14} className="text-cyan-400"/>
-          <span className="font-bold text-white">Main Router Connection</span>
-          {routerStatus==="connected" && <span className="ml-auto flex items-center gap-1.5 text-xs text-cyan-300 font-mono"><CheckCircle2 size={12}/>MANAGED {routerIdentifier}</span>}
+          <span className="font-bold text-white">Router</span>
+          <span className="text-xs text-gray-600">optional — context and traffic counters</span>
+          {statusPill(routerStatus, routerStatus==="connected" ? `CONNECTED ${routerIdentifier}` : routerStatus==="error" ? "ERROR" : router.ip ? "NOT CHECKED" : "NOT SET")}
         </div>
-        <div className="text-xs text-gray-500">Use this target for main-router metadata and packet-path context. It is not the source of Snort alerts unless Snort itself runs on that router.</div>
-        {backendStatus!=="connected" && (
-          <div className="text-xs text-yellow-500/80 bg-yellow-900/10 rounded-lg px-3 py-2 border border-yellow-900/20 flex items-center gap-1.5">
-            <AlertTriangle size={11}/>Connect the Snort API above first — router checks are performed by the backend.
-          </div>
+
+        {!editRouter ? (
+          <>
+            <div className="rounded-lg border border-gray-800 bg-black/30 px-3 py-1">
+              <SummaryRow label="Platform">{savedPlatform.label}</SummaryRow>
+              <SummaryRow label="Address" mono>{savedPlatform.transport==="api" ? `https://${router.ip}${router.apiPort && router.apiPort!=="443" ? `:${router.apiPort}` : ""}` : `${router.user || "root"}@${router.ip}:${router.port || "22"}`}</SummaryRow>
+              <SummaryRow label="Sign-in">{savedPlatform.transport==="api"
+                ? (router.hasApiKey && router.hasApiSecret ? "API key pair stored on the server" : "API key pair not set")
+                : router.authMode==="Password" ? (router.hasPassword ? "Password stored on the server" : "Password not set") : "SSH key on the server (/app/keys/router_id_rsa)"}</SummaryRow>
+              <SummaryRow label="Mode">
+                {routerReadOnly
+                  ? <span className="text-cyan-300">Read-only — SnortVision never changes the router; blocks stay on the sensor</span>
+                  : <span className="text-orange-300">Enforcing — blocks are pushed to the router</span>}
+              </SummaryRow>
+              {savedPlatform.transport==="api" && (
+                <SummaryRow label="Certificate" mono>{router.apiCertSha256 ? `pinned ${router.apiCertSha256.slice(0,29)}…` : "pinned on first connection"}</SummaryRow>
+              )}
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              <button onClick={refreshRouter} disabled={routerBusy || !router.ip || backendStatus!=="connected"}
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-bold transition-all disabled:opacity-40">
+                {routerBusy?<><RefreshCw size={12} className="animate-spin"/>Checking…</>:<><RefreshCw size={12}/>Refresh</>}
+              </button>
+              <button onClick={()=>setEditRouter(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-700 text-gray-300 hover:border-cyan-500 text-xs font-bold transition-all">
+                <Edit3 size={12}/>Edit
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            {backendStatus!=="connected" && (
+              <div className="text-xs text-yellow-500/80 bg-yellow-900/10 rounded-lg px-3 py-2 border border-yellow-900/20 flex items-center gap-1.5">
+                <AlertTriangle size={11}/>Connect the Snort API above first — router checks are made by the backend.
+              </div>
+            )}
+            <div>
+              <label className="text-xs text-gray-500 mb-1.5 block">Platform</label>
+              <div className="flex gap-2 flex-wrap">
+                {platforms.map(p=>(
+                  <button key={p.id} onClick={()=>setRouterForm(f=>({...f,routerType:p.id,
+                      authMode: p.transport==="ssh" ? (f.authMode||"SSH Key") : f.authMode,
+                      user: f.user || (p.id==="OpenWRT"||p.id==="pfSense" ? "root" : "admin")}))}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${formPlatform.id===p.id?"bg-cyan-600 border-cyan-600 text-white":"border-gray-700 text-gray-400 hover:border-gray-500"}`}>
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+              <div className="text-xs text-gray-500 mt-2 leading-5">{formPlatform.hint}</div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <FieldInput label="Router address" icon={Globe} focus="cyan" value={routerForm.ip} placeholder="192.168.1.1" onChange={v=>setRouterForm(p=>({...p,ip:v}))}/>
+              {formPlatform.transport==="api" ? (
+                <FieldInput label="HTTPS port" icon={Hash} focus="cyan" value={routerForm.apiPort} placeholder="443" onChange={v=>setRouterForm(p=>({...p,apiPort:v}))}/>
+              ) : (
+                <FieldInput label="SSH port" icon={Hash} focus="cyan" value={routerForm.port} placeholder="22" onChange={v=>setRouterForm(p=>({...p,port:v}))}/>
+              )}
+              {formPlatform.transport==="api" ? (
+                <>
+                  <FieldInput label="API key" icon={Key} focus="cyan" type="password" value={routerForm.apiKey}
+                    placeholder={secretHint(router.hasApiKey,"paste the key")} onChange={v=>setRouterForm(p=>({...p,apiKey:v.trim()}))}/>
+                  <FieldInput label="API secret" icon={Lock} focus="cyan" type={showRouterPass?"text":"password"} value={routerForm.apiSecret}
+                    placeholder={secretHint(router.hasApiSecret,"paste the secret")} onChange={v=>setRouterForm(p=>({...p,apiSecret:v.trim()}))}
+                    right={<button onClick={()=>setShowRouterPass(p=>!p)} className="absolute right-2.5 top-2.5 text-gray-600 hover:text-gray-300">{showRouterPass?<EyeOff size={14}/>:<Eye size={14}/>}</button>}/>
+                </>
+              ) : (
+                <>
+                  <FieldInput label="SSH user" icon={User} focus="cyan" value={routerForm.user} placeholder="root" onChange={v=>setRouterForm(p=>({...p,user:v}))}/>
+                  <div>
+                    <label className="text-xs text-gray-500 mb-1 block">Sign-in</label>
+                    <div className="flex gap-2">
+                      {["SSH Key","Password"].map(m=>(
+                        <button key={m} onClick={()=>setRouterForm(p=>({...p,authMode:m}))}
+                          className={`px-3 py-2 rounded-lg text-xs font-bold border transition-all ${(routerForm.authMode||"SSH Key")===m?"bg-cyan-600 border-cyan-600 text-white":"border-gray-700 text-gray-400 hover:border-gray-500"}`}>
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  {routerForm.authMode==="Password" ? (
+                    <FieldInput label="SSH password" icon={Lock} focus="cyan" type={showRouterPass?"text":"password"} value={routerForm.sshPass}
+                      placeholder={secretHint(router.hasPassword,"type it to save")} onChange={v=>setRouterForm(p=>({...p,sshPass:v}))}
+                      right={<button onClick={()=>setShowRouterPass(p=>!p)} className="absolute right-2.5 top-2.5 text-gray-600 hover:text-gray-300">{showRouterPass?<EyeOff size={14}/>:<Eye size={14}/>}</button>}/>
+                  ) : (
+                    <div className="text-xs text-gray-500 bg-gray-900/50 rounded-lg px-3 py-2 self-end">
+                      Key on the server: <span className="font-mono text-cyan-300">/app/keys/router_id_rsa</span>
+                    </div>
+                  )}
+                </>
+              )}
+              <FieldInput label="Interface to watch" icon={Activity} focus="cyan" value={routerForm.monitorInterface}
+                placeholder={formPlatform.transport==="api" ? "wan (or igc0, opt3…)" : "eth1 / br-lan / pppoe-wan"} onChange={v=>setRouterForm(p=>({...p,monitorInterface:v}))}/>
+              {formPlatform.id==="OpenWRT" && (
+                <FieldInput label="Mirror / SPAN target" icon={Link2} focus="cyan" value={routerForm.mirrorTarget}
+                  placeholder="snort-sensor:eth1" onChange={v=>setRouterForm(p=>({...p,mirrorTarget:v}))}/>
+              )}
+            </div>
+
+            <label className={`flex items-start gap-2.5 rounded-lg border px-3 py-2.5 text-xs ${formPlatform.canEnforce?"border-gray-800 cursor-pointer":"border-gray-900 opacity-70"}`}>
+              <input type="checkbox" className="mt-0.5" disabled={!formPlatform.canEnforce}
+                checked={!formPlatform.canEnforce || routerForm.readOnly !== false}
+                onChange={e=>setRouterForm(p=>({...p,readOnly:e.target.checked}))}/>
+              <span>
+                <span className="text-white font-semibold">Read-only</span>
+                <span className="text-gray-500"> — SnortVision only reads from the router; blocks stay on the sensor.
+                  {!formPlatform.canEnforce && ` ${formPlatform.label} is always read-only in SnortVision.`}</span>
+              </span>
+            </label>
+
+            <div className="flex gap-2 flex-wrap">
+              <button onClick={()=>connectRouter()} disabled={routerBusy}
+                className={`flex-1 min-w-[220px] py-2.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
+                  routerBusy?"bg-gray-700 text-gray-400 cursor-wait":"bg-blue-600 hover:bg-blue-500 text-white"}`}>
+                {routerBusy?<><RefreshCw size={14} className="animate-spin"/>Checking router…</>:<><Wifi size={14}/>Save and connect</>}
+              </button>
+              {formPlatform.transport==="api" && router.apiCertSha256 && (
+                <button onClick={()=>connectRouter({ repinCertificate:true })} disabled={routerBusy}
+                  title="Use after replacing the router's HTTPS certificate"
+                  className="px-4 py-2.5 rounded-xl border border-gray-700 text-gray-300 hover:border-cyan-500 text-sm font-bold transition-all disabled:opacity-40">
+                  Trust new certificate
+                </button>
+              )}
+              {router.ip && (
+                <button onClick={()=>{ setRouterForm({...router}); setEditRouter(false); }} className="px-4 py-2.5 rounded-xl border border-gray-700 text-gray-400 hover:text-gray-200 text-sm font-bold transition-all">
+                  Cancel
+                </button>
+              )}
+            </div>
+          </>
         )}
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Main Router Type</label>
-            <select value={routerForm.routerType||"OpenWRT"} onChange={e=>setRouterForm(p=>({...p,routerType:e.target.value}))}
-              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500">
-              {["OpenWRT","Generic Router/Linux"].map(v=><option key={v} value={v}>{v}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Main Router IP</label>
-            <div className="relative"><Globe size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={routerForm.ip||""} placeholder="192.168.1.1" onChange={e=>setRouterForm(p=>({...p,ip:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">SSH Port</label>
-            <div className="relative"><Hash size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={routerForm.port||""} placeholder="22" onChange={e=>setRouterForm(p=>({...p,port:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">SSH User</label>
-            <div className="relative"><User size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={routerForm.user||""} placeholder={routerForm.routerType==="OpenWRT"?"root":"admin"} onChange={e=>setRouterForm(p=>({...p,user:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Monitored Interface</label>
-            <div className="relative"><Activity size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={routerForm.monitorInterface||""} placeholder="eth1 / br-lan / pppoe-wan" onChange={e=>setRouterForm(p=>({...p,monitorInterface:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"/>
-            </div>
-          </div>
-          <div>
-            <label className="text-xs text-gray-500 mb-1 block">Mirror / SPAN Target</label>
-            <div className="relative"><Link2 size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={routerForm.mirrorTarget||""} placeholder="snort-sensor:eth1 or switch span note" onChange={e=>setRouterForm(p=>({...p,mirrorTarget:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"/>
-            </div>
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-xs text-gray-500 mb-1 block">SSH Password</label>
-            <div className="relative"><Lock size={13} className="absolute left-2.5 top-2.5 text-gray-600"/>
-              <input value={routerForm.sshPass||""} type={showRouterPass?"text":"password"} placeholder="••••••••" onChange={e=>setRouterForm(p=>({...p,sshPass:e.target.value}))}
-                className="w-full bg-gray-900 border border-gray-700 rounded-lg pl-8 pr-9 py-2 text-sm text-white font-mono focus:outline-none focus:border-cyan-500"/>
-              <button onClick={()=>setShowRouterPass(p=>!p)} className="absolute right-2.5 top-2.5 text-gray-600 hover:text-gray-300">{showRouterPass?<EyeOff size={14}/>:<Eye size={14}/>}</button>
-            </div>
-          </div>
-        </div>
-
-        <div className="flex gap-2 flex-wrap">
-          {["Password","SSH Key"].map(m=>(
-            <button key={m} onClick={()=>setRouterForm(p=>({...p,authMode:m}))}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${routerForm.authMode===m?"bg-cyan-600 border-cyan-600 text-white":"border-gray-700 text-gray-400 hover:border-gray-500"}`}>
-              {m==="SSH Key"?<span className="flex items-center gap-1.5"><Key size={11}/>{m}</span>:<span className="flex items-center gap-1.5"><Lock size={11}/>{m}</span>}
-            </button>
-          ))}
-        </div>
-        {routerForm.authMode==="SSH Key" && (
-          <div className="text-xs text-gray-500 bg-gray-900/50 rounded-lg px-3 py-2 font-mono">
-            Main router SSH key path: <span className="text-cyan-300">/app/keys/router_id_rsa</span>
-          </div>
-        )}
-
-        <div className="flex gap-2 flex-wrap">
-          <button onClick={connectRouter} disabled={routerBusy}
-            className={`flex-1 min-w-[220px] py-2.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${
-              routerBusy?"bg-gray-700 text-gray-400 cursor-wait":routerStatus==="connected"?"bg-cyan-600 text-white":"bg-blue-600 hover:bg-blue-500 text-white"}`}>
-            {routerBusy?<><RefreshCw size={14} className="animate-spin"/>Checking main router…</>:routerStatus==="connected"?<><Check size={14}/>Main router connected</>:<><Wifi size={14}/>Connect Main Router</>}
-          </button>
-          <button onClick={refreshRouter} disabled={routerBusy || !routerForm.ip} className="px-4 py-2.5 rounded-xl border border-gray-700 text-gray-300 hover:border-cyan-500 hover:text-cyan-300 text-sm font-bold transition-all flex items-center gap-1.5 disabled:opacity-40">
-            <RefreshCw size={14}/>Refresh Router Info
-          </button>
-          {(routerStatus==="connected" || router.connected) && (
-            <button onClick={disconnectRouter} className="px-4 py-2.5 rounded-xl border border-gray-700 text-gray-400 hover:border-red-700 hover:text-red-400 text-sm font-bold transition-all flex items-center gap-1.5">
-              <Unlink size={14}/>Disconnect
-            </button>
-          )}
-        </div>
 
         {(router.lastMessage || router.lastError) && (
           <div className={`flex items-center gap-2 text-xs rounded-lg px-3 py-2 border ${router.lastError?"text-red-400 bg-red-900/10 border-red-900/30":"text-cyan-200 bg-cyan-900/10 border-cyan-900/30"}`}>
@@ -3414,14 +3487,16 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
           </div>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-          {infoCards.map(card=>(
-            <div key={card.label} className="rounded-xl border border-gray-800 bg-black/30 p-3">
-              <div className="text-[11px] uppercase tracking-wider text-gray-500 mb-1">{card.label}</div>
-              <div className={`${card.mono?"font-mono":""} text-sm text-white break-words`}>{card.value}</div>
-            </div>
-          ))}
-        </div>
+        {routerInfo && (routerInfo.hostname || routerInfo.firmwareVersion) && (
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {infoCards.map(card=>(
+              <div key={card.label} className="rounded-xl border border-gray-800 bg-black/30 p-3">
+                <div className="text-[11px] text-gray-500 mb-1">{card.label}</div>
+                <div className={`${card.mono?"font-mono":""} text-sm text-white break-words`}>{card.value}</div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="rounded-xl border border-gray-800 bg-gray-950 p-4">
@@ -3461,6 +3536,9 @@ function Connection({ host, setHost, router, setRouter, backendUrl, setBackendUr
 }
 
 // ─── Persistence (localStorage) ─────────────────────────────────────────────
+// Secret fields are always blanked before anything is written to browser storage.
+const BLANK_SENSOR_SECRETS = { sshPass:"", sudoPass:"", password:"", sudoPassword:"" };
+const BLANK_ROUTER_SECRETS = { sshPass:"", password:"", apiKey:"", apiSecret:"" };
 function loadSaved(key, fallback) {
   try { const v = localStorage.getItem(`sv_${key}`); return v ? JSON.parse(v) : fallback; }
   catch { return fallback; }
@@ -3535,8 +3613,9 @@ export default function SnortVision() {
   const [toasts,setToasts]   = useState([]);
   const [ddosMode,setDdosMode] = useState(false);
   const [theme,setTheme]     = useState(()=>loadSaved("theme","dark"));
-  const [host,setHost]       = useState(()=>loadSaved("host",{ip:"192.168.10.50",port:"22",user:"snort",sshPass:"",sudoPass:"",authMode:"SSH Key",logPath:"/var/log/snort/alert_json.txt",connected:false}));
-  const [router,setRouter]   = useState(()=>loadSaved("router",{ip:"",port:"22",user:"root",sshPass:"",authMode:"Password",routerType:"OpenWRT",monitorInterface:"",mirrorTarget:"",connected:false,routerInfo:null}));
+  // Settings live on the server; the browser keeps only a non-secret copy for a fast first paint.
+  const [host,setHost]       = useState(()=>({ ...loadSaved("host",{ip:"",port:"22",user:"snort",authMode:"SSH Key",logPath:"/var/log/snort/alert_json.txt"}), ...BLANK_SENSOR_SECRETS, connected:false }));
+  const [router,setRouter]   = useState(()=>({ ...loadSaved("router",{ip:"",port:"22",user:"root",authMode:"SSH Key",routerType:"OPNsense",apiPort:"443",readOnly:true,monitorInterface:"",mirrorTarget:"",routerInfo:null}), ...BLANK_ROUTER_SECRETS, connected:false }));
   const tickRef   = useRef(0);
   const lastIdRef = useRef(0);
 
@@ -3573,8 +3652,8 @@ export default function SnortVision() {
   const [autoBlock,setAutoBlock] = useState({ enabled:true, threshold:10, window:30, blockDuration:60, minSeverity:"medium" });
 
   // Persist settings on change (connected:false to avoid stale state on reload)
-  useEffect(()=>{ saveSetting("host",{...host,connected:false}); },[host]);
-  useEffect(()=>{ saveSetting("router",{...router,connected:false}); },[router]);
+  useEffect(()=>{ saveSetting("host",{...host,...BLANK_SENSOR_SECRETS,connected:false}); },[host]);
+  useEffect(()=>{ saveSetting("router",{...router,...BLANK_ROUTER_SECRETS,platforms:undefined,connected:false}); },[router]);
   useEffect(()=>{ saveSetting("backendUrl",backendUrl); },[backendUrl]);
   useEffect(()=>{ saveSetting("apiKey",apiKey); },[apiKey]);
   useEffect(()=>{ saveSetting("theme",theme); document.documentElement.dataset.theme = theme; },[theme]);
@@ -3645,7 +3724,7 @@ export default function SnortVision() {
             if(cRes.ok) {
               const c = await cRes.json();
               setHost(p=>({...p, ip:c.ip||"", port:c.port||"22", user:c.user||"snort", authMode:c.authMode||"SSH Key",
-                logPath:c.logPath||p.logPath, sshPass:"", sudoPass:"" }));
+                logPath:c.logPath||p.logPath, hasPassword:!!c.hasPassword, hasSudoPassword:!!c.hasSudoPassword, ...BLANK_SENSOR_SECRETS }));
             }
           } catch {}
 
@@ -3653,14 +3732,20 @@ export default function SnortVision() {
             const rRes = await fetch(`${backendUrl}/api/config/router`,{ headers:{"X-API-Key":apiKey} });
             if(rRes.ok) {
               const r = await rRes.json();
-              setRouter(p=>({...p, ip:r.ip||"", port:r.port||"22", user:r.user||"root", authMode:r.authMode||"Password",
-                routerType:r.routerType||p.routerType, monitorInterface:r.monitorInterface||"", mirrorTarget:r.mirrorTarget||"", sshPass:"" }));
+              setRouter(p=>({...p, ip:r.ip||"", port:r.port||"22", user:r.user||"root", authMode:r.authMode||"SSH Key",
+                routerType:r.routerType||p.routerType, monitorInterface:r.monitorInterface||"", mirrorTarget:r.mirrorTarget||"",
+                apiPort:r.apiPort||"443", readOnly:r.readOnly!==false, apiCertSha256:r.apiCertSha256||"",
+                hasPassword:!!r.hasPassword, hasApiKey:!!r.hasApiKey, hasApiSecret:!!r.hasApiSecret, platforms:r.platforms,
+                ...BLANK_ROUTER_SECRETS }));
               if(r.ip) {
                 const iRes = await fetch(`${backendUrl}/api/router/info`,{ headers:{"X-API-Key":apiKey} });
                 const iData = await iRes.json();
                 if(iData.ok) {
                   setRouterStatus("connected");
                   setRouter(p=>({...p,connected:true,routerInfo:iData.info || p.routerInfo,lastError:""}));
+                } else {
+                  setRouterStatus("error");
+                  setRouter(p=>({...p,connected:false,lastError:iData.info?.error || iData.message || "Router check failed"}));
                 }
               }
             }
