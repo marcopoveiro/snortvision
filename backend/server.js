@@ -20,6 +20,7 @@ const cors       = require("cors");
 const { exec, spawn } = require("child_process");
 const net = require("net");
 const https = require("https");
+const tls = require("tls");
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const PORT     = parseInt(process.env.PORT     || "4000");
@@ -585,6 +586,12 @@ function getRouterConfig() {
   return { ...defaults, ...dbGet("router_connection", {}) };
 }
 
+// Interface names end up in shell commands on the router, so only plain names pass.
+const SAFE_IFACE = /^[A-Za-z0-9_.:@-]{1,32}$/;
+function validInterfaceList(value) {
+  return parseInterfaceList(value).every(i => SAFE_IFACE.test(i));
+}
+
 // Secrets never leave the server: the browser only learns whether one is set.
 const ROUTER_SECRETS = ["password", "apiKey", "apiSecret"];
 const SENSOR_SECRETS = ["password", "sudoPassword"];
@@ -598,16 +605,24 @@ function redactConfig(cfg, secrets) {
   return out;
 }
 
-// An empty secret in a save means "keep the one already stored".
-function mergeConfig(base, body, secrets) {
+// An empty secret in a save means "keep the one already stored" — but only while
+// the target stays the same. Pointing the config at another host, port, user or
+// platform drops stored secrets, so they can never be sent somewhere new.
+function mergeConfig(base, body, secrets, identity) {
   const out = { ...base };
   for (const [k, v] of Object.entries(body || {})) {
     if (k.startsWith("has")) continue;
     if (secrets.includes(k) && !cleanValue(v)) continue;
     out[k] = v;
   }
+  const moved = identity.some(k => cleanValue(out[k]) !== cleanValue(base[k]));
+  if (moved) {
+    for (const k of secrets) if (!cleanValue(body?.[k])) out[k] = "";
+  }
   return out;
 }
+const ROUTER_IDENTITY = ["ip", "port", "apiPort", "user", "routerType", "authMode"];
+const SENSOR_IDENTITY = ["ip", "port", "user", "authMode"];
 
 function buildSshOptions(cfg = getConnConfig()) {
   const opts = {
@@ -764,24 +779,46 @@ function routerCanEnforce(cfg = getRouterConfig()) {
 // Talks to the OPNsense REST API with a key pair. The router's certificate is
 // normally self-signed, so it is pinned on first use (SHA-256) instead of being
 // checked against a CA; a later mismatch is refused.
-function opnsenseApi(cfg, apiPath, timeoutMs = 8000) {
+// The TLS handshake finishes and the certificate is checked against the pin
+// before the request (and its credentials) is written to the socket.
+function openPinnedTls(cfg, timeoutMs) {
   return new Promise((resolve, reject) => {
-    if (!cleanValue(cfg.apiKey) || !cleanValue(cfg.apiSecret)) return reject(new Error("OPNsense API key and secret are not set"));
+    const sock = tls.connect({
+      host: cfg.ip,
+      port: parseInt(cfg.apiPort || "443", 10),
+      servername: net.isIP(cfg.ip) ? undefined : cfg.ip,
+      rejectUnauthorized: false,
+    });
+    sock.setTimeout(timeoutMs, () => sock.destroy(new Error(`OPNsense API timeout on ${cfg.ip}`)));
+    sock.once("error", reject);
+    sock.once("secureConnect", () => {
+      const fp = sock.getPeerCertificate()?.fingerprint256 || "";
+      if (!fp) { sock.destroy(); return reject(new Error("Router sent no TLS certificate")); }
+      if (cfg.apiCertSha256 && fp !== cfg.apiCertSha256) {
+        sock.destroy();
+        return reject(new Error(`Router certificate changed (pinned ${cfg.apiCertSha256.slice(0, 23)}…, got ${fp.slice(0, 23)}…) — use "Trust new certificate" in Connection if this is expected`));
+      }
+      sock.removeListener("error", reject);
+      resolve({ sock, fp });
+    });
+  });
+}
+
+async function opnsenseApi(cfg, apiPath, timeoutMs = 8000) {
+  if (!cleanValue(cfg.apiKey) || !cleanValue(cfg.apiSecret)) throw new Error("OPNsense API key and secret are not set");
+  const { sock, fp } = await openPinnedTls(cfg, timeoutMs);
+  return new Promise((resolve, reject) => {
     const req = https.request({
       host: cfg.ip,
       port: parseInt(cfg.apiPort || "443", 10),
       path: `/api/${apiPath}`,
       method: "GET",
       auth: `${cfg.apiKey}:${cfg.apiSecret}`,
-      rejectUnauthorized: false,
+      agent: false,
+      createConnection: () => sock,
       timeout: timeoutMs,
-      headers: { Accept: "application/json" },
+      headers: { Accept: "application/json", Connection: "close" },
     }, (res) => {
-      const fp = res.socket.getPeerCertificate()?.fingerprint256 || "";
-      if (cfg.apiCertSha256 && fp && fp !== cfg.apiCertSha256) {
-        res.destroy();
-        return reject(new Error(`Router certificate changed (pinned ${cfg.apiCertSha256.slice(0, 23)}…, got ${fp.slice(0, 23)}…) — re-pin it in Connection if this is expected`));
-      }
       let body = "";
       res.setEncoding("utf8");
       res.on("data", c => { body += c; });
@@ -1268,8 +1305,9 @@ async function gatherPfSenseRouterInfo(cfg) {
   const hostname = await sshExecValue(`hostname`, cfg);
   const firmware = await sshExecValue(`cat /etc/version 2>/dev/null; uname -r`, cfg);
   const interfaces = await sshExecValue(`ifconfig -l`, cfg);
-  const monitorIf = firstNonEmpty(cleanValue(cfg.monitorInterface), await sshExecValue(`route -n get default 2>/dev/null | awk '/interface:/{print $2}'`, cfg));
-  const wanIp = monitorIf ? await sshExecValue(`ifconfig ${JSON.stringify(monitorIf)} 2>/dev/null | awk '/inet /{print $2; exit}'`, cfg) : "";
+  const detectedIf = firstNonEmpty(cleanValue(cfg.monitorInterface), await sshExecValue(`route -n get default 2>/dev/null | awk '/interface:/{print $2}'`, cfg));
+  const monitorIf = SAFE_IFACE.test(detectedIf) ? detectedIf : "";
+  const wanIp = monitorIf ? await sshExecValue(`ifconfig '${monitorIf}' 2>/dev/null | awk '/inet /{print $2; exit}'`, cfg) : "";
   const counters = await readFreeBsdCounters(cfg).catch(() => ({}));
   const mon = counters[monitorIf];
   return {
@@ -2722,7 +2760,7 @@ app.get("/api/iptables", auth, async (req, res) => {
 app.get("/api/config/connection", auth, (req, res) => res.json(redactConfig(getConnConfig(), SENSOR_SECRETS)));
 
 app.post("/api/config/connection", auth, (req, res) => {
-  const cfg = mergeConfig(getConnConfig(), req.body, SENSOR_SECRETS);
+  const cfg = mergeConfig(getConnConfig(), req.body, SENSOR_SECRETS, SENSOR_IDENTITY);
   dbSet("connection", cfg);
 
   // Write to .env for persistence across restarts
@@ -2770,7 +2808,11 @@ app.get("/api/config/router", auth, (req, res) => res.json({
 
 app.post("/api/config/router", auth, async (req, res) => {
   const base = getRouterConfig();
-  const cfg = mergeConfig(base, req.body, ROUTER_SECRETS);
+  if (req.body?.routerType) req.body.routerType = normalizeRouterType(req.body.routerType);
+  if (!validInterfaceList(req.body?.monitorInterface)) {
+    return res.status(400).json({ ok: false, message: "Interface names may only contain letters, digits and . _ : @ -" });
+  }
+  const cfg = mergeConfig(base, req.body, ROUTER_SECRETS, ROUTER_IDENTITY);
   cfg.routerType = normalizeRouterType(cfg.routerType);
   cfg.readOnly = cfg.readOnly !== false;
   // A new address or a re-pin request drops the pinned certificate.
