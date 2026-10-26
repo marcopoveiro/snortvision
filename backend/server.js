@@ -1404,7 +1404,16 @@ function startTail(onLine, ctx, logPathOverride) {
       }
       let buf = "";
       stream.on("data", d => {
-        buf += d.toString();
+        // copytruncate rotation leaves Snort writing at its old offset, so the
+        // file starts with a hole of NUL bytes and no newline: drop NULs, and
+        // never let an unterminated line grow (re-splitting it was O(n²) and
+        // pinned the event loop at 100%).
+        buf += d.toString().replace(/\0+/g, "");
+        if (buf.length > 1024 * 1024 && buf.indexOf("\n") === -1) {
+          console.warn(`${tag} dropped ${buf.length} bytes without a newline`);
+          buf = "";
+          return;
+        }
         const lines = buf.split("\n");
         buf = lines.pop();
         for (const l of lines) {
