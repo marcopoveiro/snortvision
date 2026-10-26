@@ -405,16 +405,25 @@ const insertFlow = db.prepare(`
 `);
 
 // ─── DB retention ────────────────────────────────────────────────────────────
-const MAX_ALERTS = parseInt(process.env.MAX_ALERTS || "500000", 10);
+// Alerts are kept by age (ALERT_RETENTION_DAYS); MAX_ALERTS is only a safety
+// cap for an alert storm. Deletes run in batches so one prune never holds the
+// event loop for long.
+const ALERT_RETENTION_DAYS = parseInt(process.env.ALERT_RETENTION_DAYS || "10", 10);
+const MAX_ALERTS = parseInt(process.env.MAX_ALERTS || "4000000", 10);
+const PRUNE_BATCH = 20000;
 const pruneStmt  = db.prepare("DELETE FROM alerts WHERE id IN (SELECT id FROM alerts ORDER BY id ASC LIMIT ?)");
+const pruneOldStmt = db.prepare(`DELETE FROM alerts WHERE id IN (SELECT id FROM alerts
+  WHERE ts < strftime('%Y-%m-%dT%H:%M:%fZ','now',?) LIMIT ${PRUNE_BATCH})`);
 
 function pruneAlerts() {
   try {
+    const old = pruneOldStmt.run(`-${ALERT_RETENTION_DAYS} days`).changes;
+    if (old) console.log(`[DB] Pruned ${old} alerts older than ${ALERT_RETENTION_DAYS} days`);
     const count = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
     if (count > MAX_ALERTS) {
-      const toDel = count - MAX_ALERTS;
+      const toDel = Math.min(count - MAX_ALERTS, PRUNE_BATCH);
       pruneStmt.run(toDel);
-      console.log(`[DB] Pruned ${toDel} old alerts (retention: ${MAX_ALERTS})`);
+      console.log(`[DB] Pruned ${toDel} old alerts (cap: ${MAX_ALERTS})`);
     }
   } catch(e) { console.error("[DB] prune error:", e.message); }
 }
