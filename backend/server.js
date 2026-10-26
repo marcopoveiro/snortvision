@@ -814,7 +814,8 @@ async function opnsenseApi(cfg, apiPath, timeoutMs = 8000) {
       path: `/api/${apiPath}`,
       method: "GET",
       auth: `${cfg.apiKey}:${cfg.apiSecret}`,
-      agent: false,
+      // No "agent" key: with agent:false Node ignores createConnection and opens
+      // its own unpinned connection.
       createConnection: () => sock,
       timeout: timeoutMs,
       headers: { Accept: "application/json", Connection: "close" },
