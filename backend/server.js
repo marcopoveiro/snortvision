@@ -1454,8 +1454,10 @@ function startTail(onLine, ctx, logPathOverride) {
         if (msg && !msg.includes("file truncated")) console.warn(`${tag} stderr`, msg);
       });
       stream.on("close", () => scheduleReconnect(5000, "stream closed"));
-      // Send the tail command into the shell
-      stream.write(`tail -n 0 -F "${remotePath}"\n`);
+      // Send the tail command into the shell. Prefer GNU tail: Ubuntu 26.04's
+      // default tail (uutils 0.2.x) ignores -n 0 on a PTY and dumps the whole
+      // file, replaying weeks of old alerts on every (re)connect.
+      stream.write(`$(command -v gnutail || echo tail) -n 0 -F "${remotePath}"\n`);
     });
   });
 
