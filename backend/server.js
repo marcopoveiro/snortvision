@@ -1505,7 +1505,8 @@ app.get("/api/public/health", (req, res) => {
 // Devices on these IPs/CIDRs get the API key handed to them by
 // /api/public/client-config, so they connect without typing it.
 // Real client IP = walk X-Forwarded-For right-to-left, skipping our own
-// proxies (docker network, loopback, SV_PROXY_IPS e.g. the NPM host).
+// proxies (SV_PROXY_IPS only: the compose network + the NPM host). No proxy
+// list or no non-proxy hop → no client IP → nobody is trusted (fail closed).
 function ipv4ToInt(ip) {
   const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip || "");
   if (!m) return null;
@@ -1527,7 +1528,7 @@ function inNets(ip, nets) {
   return n !== null && nets.some(x => ((n & x.mask) >>> 0) === x.base);
 }
 const TRUSTED_NETS = parseNets(process.env.SV_TRUSTED_NETS);
-const PROXY_NETS   = parseNets(`127.0.0.0/8 172.16.0.0/12 ${process.env.SV_PROXY_IPS || ""}`);
+const PROXY_NETS   = parseNets(process.env.SV_PROXY_IPS);
 
 function clientIp(req) {
   const strip = ip => String(ip || "").trim().replace(/^::ffff:/, "");
@@ -1536,7 +1537,7 @@ function clientIp(req) {
   for (let i = chain.length - 1; i >= 0; i--) {
     if (!inNets(chain[i], PROXY_NETS)) return chain[i];
   }
-  return chain[0];
+  return null;
 }
 
 function auth(req, res, next) {
