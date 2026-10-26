@@ -51,6 +51,9 @@ services:
       - ROUTER_SSH_KEY_PATH=/app/keys/router_id_rsa
       # Optional API key auth (leave blank = no auth)
       - API_KEY=${API_KEY:-}
+      # Devices that get the API key automatically (IPs/CIDRs) + our reverse proxies
+      - SV_TRUSTED_NETS=${SV_TRUSTED_NETS:-}
+      - SV_PROXY_IPS=${SV_PROXY_IPS:-}
       # GeoIP (set true after: docker compose exec backend npm run geoip-update)
       - GEOIP_ENABLE=${GEOIP_ENABLE:-false}
       # Telegram alerts

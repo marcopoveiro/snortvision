@@ -1501,6 +1501,44 @@ app.get("/api/public/health", (req, res) => {
 });
 
 // Optional API key auth middleware
+// ─── Trusted devices (SV_TRUSTED_NETS) ───────────────────────────────────────
+// Devices on these IPs/CIDRs get the API key handed to them by
+// /api/public/client-config, so they connect without typing it.
+// Real client IP = walk X-Forwarded-For right-to-left, skipping our own
+// proxies (docker network, loopback, SV_PROXY_IPS e.g. the NPM host).
+function ipv4ToInt(ip) {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip || "");
+  if (!m) return null;
+  const o = m.slice(1).map(Number);
+  if (o.some(n => n > 255)) return null;
+  return ((o[0] << 24) | (o[1] << 16) | (o[2] << 8) | o[3]) >>> 0;
+}
+function parseNets(str) {
+  return String(str || "").split(/[\s,]+/).filter(Boolean).map(entry => {
+    const [ip, bits = "32"] = entry.split("/");
+    const base = ipv4ToInt(ip), b = parseInt(bits, 10);
+    if (base === null || !(b >= 0 && b <= 32)) { console.warn(`[trust] ignored entry: ${entry}`); return null; }
+    const mask = b === 0 ? 0 : (~0 << (32 - b)) >>> 0;
+    return { base: (base & mask) >>> 0, mask };
+  }).filter(Boolean);
+}
+function inNets(ip, nets) {
+  const n = ipv4ToInt(ip);
+  return n !== null && nets.some(x => ((n & x.mask) >>> 0) === x.base);
+}
+const TRUSTED_NETS = parseNets(process.env.SV_TRUSTED_NETS);
+const PROXY_NETS   = parseNets(`127.0.0.0/8 172.16.0.0/12 ${process.env.SV_PROXY_IPS || ""}`);
+
+function clientIp(req) {
+  const strip = ip => String(ip || "").trim().replace(/^::ffff:/, "");
+  const chain = String(req.headers["x-forwarded-for"] || "").split(",").map(strip).filter(Boolean);
+  chain.push(strip(req.socket.remoteAddress));
+  for (let i = chain.length - 1; i >= 0; i--) {
+    if (!inNets(chain[i], PROXY_NETS)) return chain[i];
+  }
+  return chain[0];
+}
+
 function auth(req, res, next) {
   if (!API_KEY) return next();
   const k = req.headers["x-api-key"] || req.query.key;
@@ -3150,10 +3188,15 @@ app.post("/api/public/geoip", async (req, res) => {
 });
 
 app.get("/api/public/client-config", (req, res) => {
+  const ip = clientIp(req);
+  const trusted = !!API_KEY && inNets(ip, TRUSTED_NETS);
+  if (trusted) console.log(`[trust] API key handed to ${ip}`);
+  res.set("Cache-Control", "no-store");
   res.json({
     backendUrl:   process.env.BACKEND_URL || "",
     requiresAuth: !!(API_KEY),
     version:      "0.2",
+    ...(trusted ? { apiKey: API_KEY } : {}),
   });
 });
 

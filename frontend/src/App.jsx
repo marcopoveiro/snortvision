@@ -3580,13 +3580,14 @@ export default function SnortVision() {
   useEffect(()=>{ saveSetting("theme",theme); document.documentElement.dataset.theme = theme; },[theme]);
   useEffect(()=>{ saveSetting("page",page); },[page]);
 
-  // ── Recover backendUrl from server if localStorage was cleared ──────────────
+  // ── Recover backendUrl / API key from server (trusted devices get the key) ──
   useEffect(()=>{
-    if(backendUrl) return; // already have it
-    fetch("/api/public/client-config")
+    if(backendUrl && apiKey) return; // already have both
+    fetch("/api/public/client-config", { cache:"no-store" })
       .then(r=>{ if(!r.ok) throw new Error("no config"); return r.json(); })
       .then(cfg=>{
-        if(!cfg.backendUrl) return;
+        if(cfg.apiKey && !apiKey) setApiKey(cfg.apiKey);
+        if(backendUrl || !cfg.backendUrl) return;
         // The stored BACKEND_URL may have been auto-saved from a LAN session
         // (e.g. http://192.168.1.20:3000). Behind a reverse proxy (Nginx Proxy
         // Manager → frontend:3000, which proxies /api same-origin) that value is
@@ -3609,8 +3610,10 @@ export default function SnortVision() {
   useEffect(()=>{ backendRef.current = {url:backendUrl, key:apiKey, status:backendStatus}; },[backendUrl,apiKey,backendStatus]);
 
   // ── Auto-reconnect on page load — tests API, SSH, DB, Snort in sequence
+  const startupKeyRef = useRef("");
   useEffect(()=>{
-    if(!backendUrl || !apiKey) return;
+    if(!backendUrl || !apiKey || startupKeyRef.current===apiKey) return;
+    startupKeyRef.current = apiKey;
     (async ()=>{
       // 1. Test Snort API
       try {
@@ -3635,54 +3638,37 @@ export default function SnortVision() {
             }
           } catch {}
 
-          // 3. Test SSH if host configured
-          const savedHost = loadSaved("host",{});
-          if(savedHost.ip) {
-            try {
-              const sshRes = await fetch(`${backendUrl}/api/config/connection`,{
-                method:"POST",
-                headers:{"Content-Type":"application/json","X-API-Key":apiKey},
-                body:JSON.stringify({
-                  ip: savedHost.ip, port: savedHost.port || "22", user: savedHost.user || "snort",
-                  password: savedHost.sshPass || "", sudoPassword: savedHost.sudoPass || "", authMode: savedHost.authMode || "SSH Key",
-                  logPath: savedHost.logPath || "/var/log/snort/alert_json.txt",
-                  keyPath: "/app/keys/snort_id_rsa",
-                })
-              });
-              const sshData = await sshRes.json();
-              if(sshData.ok) { setSshStatus("connected"); setHost(p=>({...p,connected:true})); }
-            } catch {}
-          }
+          // 3. Sensor + router settings live on the server — read them, never
+          //    push this browser's saved copy (a stale one would overwrite the server's).
+          try {
+            const cRes = await fetch(`${backendUrl}/api/config/connection`,{ headers:{"X-API-Key":apiKey} });
+            if(cRes.ok) {
+              const c = await cRes.json();
+              setHost(p=>({...p, ip:c.ip||"", port:c.port||"22", user:c.user||"snort", authMode:c.authMode||"SSH Key",
+                logPath:c.logPath||p.logPath, sshPass:"", sudoPass:"" }));
+            }
+          } catch {}
 
-          const savedRouter = loadSaved("router",{});
-          if(savedRouter.ip) {
-            try {
-              const routerRes = await fetch(`${backendUrl}/api/config/router`,{
-                method:"POST",
-                headers:{"Content-Type":"application/json","X-API-Key":apiKey},
-                body:JSON.stringify({
-                  ip: savedRouter.ip,
-                  port: savedRouter.port || "22",
-                  user: savedRouter.user || "root",
-                  password: savedRouter.sshPass || "",
-                  authMode: savedRouter.authMode || "Password",
-                  keyPath: "/app/keys/router_id_rsa",
-                  routerType: savedRouter.routerType || "OpenWRT",
-                  monitorInterface: savedRouter.monitorInterface || "",
-                  mirrorTarget: savedRouter.mirrorTarget || "",
-                })
-              });
-              const routerData = await routerRes.json();
-              if(routerData.ok) {
-                setRouterStatus("connected");
-                setRouter(p=>({...p,connected:true,routerInfo:routerData.info || p.routerInfo,lastError:"",lastMessage:routerData.message || ""}));
+          try {
+            const rRes = await fetch(`${backendUrl}/api/config/router`,{ headers:{"X-API-Key":apiKey} });
+            if(rRes.ok) {
+              const r = await rRes.json();
+              setRouter(p=>({...p, ip:r.ip||"", port:r.port||"22", user:r.user||"root", authMode:r.authMode||"Password",
+                routerType:r.routerType||p.routerType, monitorInterface:r.monitorInterface||"", mirrorTarget:r.mirrorTarget||"", sshPass:"" }));
+              if(r.ip) {
+                const iRes = await fetch(`${backendUrl}/api/router/info`,{ headers:{"X-API-Key":apiKey} });
+                const iData = await iRes.json();
+                if(iData.ok) {
+                  setRouterStatus("connected");
+                  setRouter(p=>({...p,connected:true,routerInfo:iData.info || p.routerInfo,lastError:""}));
+                }
               }
-            } catch {}
-          }
+            }
+          } catch {}
         }
       } catch {}
     })();
-  },[]);  // eslint-disable-line react-hooks/exhaustive-deps
+  },[backendUrl, apiKey]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
   if (backendStatus !== "connected" || !backendUrl || !apiKey) return;
