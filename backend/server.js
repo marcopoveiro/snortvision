@@ -309,6 +309,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_alerts_ts     ON alerts(ts);
   CREATE INDEX IF NOT EXISTS idx_alerts_sev    ON alerts(severity);
   CREATE INDEX IF NOT EXISTS idx_alerts_src_ip ON alerts(src_ip);
+  CREATE INDEX IF NOT EXISTS idx_alerts_action ON alerts(action);
+  CREATE INDEX IF NOT EXISTS idx_alerts_cat_ts ON alerts(category, ts);
 
   CREATE TABLE IF NOT EXISTS blocklist (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1575,9 +1577,9 @@ app.get("/api/health", auth, async (req, res) => {
     db_size = (s.size / 1024 / 1024).toFixed(1) + " MB";
   } catch (_) {}
 
-  const recentAlerts = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > datetime('now','-5 seconds')").get().c;
+  const recentAlerts = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 seconds')").get().c;
   const alert_pps = Math.round(recentAlerts / 5);
-  const ddos_alerts_10s = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE category='DDOS' AND ts > datetime('now','-10 seconds')").get().c;
+  const ddos_alerts_10s = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE category='DDOS' AND ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 seconds')").get().c;
 
   const traffic = await getTrafficTelemetry().catch(err => ({
     real: false,
@@ -1701,7 +1703,7 @@ app.post("/api/flows/options", auth, (req, res) => {
 // Aggregates for the map / dashboard (top talkers, countries, protocols)
 app.get("/api/flows/stats", auth, (req, res) => {
   const mins = Math.min(parseInt(req.query.minutes || "60"), 1440);
-  const since = `datetime('now','-${mins} minutes')`;
+  const since = `strftime('%Y-%m-%dT%H:%M:%fZ','now','-${mins} minutes')`;
   const topTalkers = db.prepare(
     `SELECT ext_ip, country, COUNT(*) c, SUM(orig_bytes+resp_bytes) bytes
      FROM flows WHERE ts > ${since} GROUP BY ext_ip ORDER BY c DESC LIMIT 20`).all();
@@ -1722,9 +1724,9 @@ app.get("/api/alerts/new", auth, async (req, res) => {
   const since = parseInt(req.query.since) || 0;
   const alerts = db.prepare("SELECT * FROM alerts WHERE id > ? ORDER BY id ASC LIMIT 100").all(since).map(enrichAlertGeo);
 
-  const recentAlerts = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > datetime('now','-5 seconds')").get().c;
+  const recentAlerts = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 seconds')").get().c;
   const alert_pps = Math.round(recentAlerts / 5);
-  const ddos_alerts_10s = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE category='DDOS' AND ts > datetime('now','-10 seconds')").get().c;
+  const ddos_alerts_10s = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE category='DDOS' AND ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 seconds')").get().c;
 
   const traffic = await getTrafficTelemetry().catch(() => ({
     real: false,
@@ -1756,15 +1758,28 @@ app.get("/api/alerts/new", auth, async (req, res) => {
 });
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
-app.get("/api/stats", auth, async (req, res) => {
-  const total = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
-  const critical = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE severity='critical'").get().c;
-  const blocked = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE action='BLOCKED'").get().c;
-  const lastMin = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > datetime('now','-1 minute')").get().c;
+// Whole-table counters are polled by every open dashboard — compute at most every 3 s.
+// Timestamps are stored as ISO strings ('…T…Z'), so time windows must use the same
+// format (strftime), never datetime('now') — '2026-10-26T…' > '2026-10-26 …' always.
+let alertTotalsCache = { at: 0 };
+function alertTotals() {
+  if (Date.now() - alertTotalsCache.at < 3000) return alertTotalsCache;
+  alertTotalsCache = {
+    at:       Date.now(),
+    total:    db.prepare("SELECT COUNT(*) as c FROM alerts").get().c,
+    critical: db.prepare("SELECT COUNT(*) as c FROM alerts WHERE severity='critical'").get().c,
+    blocked:  db.prepare("SELECT COUNT(*) as c FROM alerts WHERE action='BLOCKED'").get().c,
+  };
+  return alertTotalsCache;
+}
 
-  const recentAlerts = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > datetime('now','-5 seconds')").get().c;
+app.get("/api/stats", auth, async (req, res) => {
+  const { total, critical, blocked } = alertTotals();
+  const lastMin = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 minute')").get().c;
+
+  const recentAlerts = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-5 seconds')").get().c;
   const alert_pps = Math.round(recentAlerts / 5);
-  const ddos_alerts_10s = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE category='DDOS' AND ts > datetime('now','-10 seconds')").get().c;
+  const ddos_alerts_10s = db.prepare("SELECT COUNT(*) as c FROM alerts WHERE category='DDOS' AND ts > strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 seconds')").get().c;
 
   const traffic = await getTrafficTelemetry().catch(() => ({
     real: false,
@@ -3072,7 +3087,7 @@ app.delete("/api/alerts", auth, (req, res) => {
   const days = parseInt(req.query.days);
   let deleted;
   if (days && days > 0) {
-    const result = db.prepare(`DELETE FROM alerts WHERE ts < datetime('now','-${days} days')`).run();
+    const result = db.prepare(`DELETE FROM alerts WHERE ts < strftime('%Y-%m-%dT%H:%M:%fZ','now','-${days} days')`).run();
     deleted = result.changes;
   } else {
     const result = db.prepare("DELETE FROM alerts").run();
