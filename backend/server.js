@@ -415,17 +415,30 @@ const pruneStmt  = db.prepare("DELETE FROM alerts WHERE id IN (SELECT id FROM al
 const pruneOldStmt = db.prepare(`DELETE FROM alerts WHERE id IN (SELECT id FROM alerts
   WHERE ts < strftime('%Y-%m-%dT%H:%M:%fZ','now',?) LIMIT ${PRUNE_BATCH})`);
 
+// Each call deletes one batch; while a batch comes back full there is more to
+// clear, so the next batch is queued with setImmediate (other work runs between).
+let pruneRunning = false;
 function pruneAlerts() {
-  try {
-    const old = pruneOldStmt.run(`-${ALERT_RETENTION_DAYS} days`).changes;
-    if (old) console.log(`[DB] Pruned ${old} alerts older than ${ALERT_RETENTION_DAYS} days`);
-    const count = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
-    if (count > MAX_ALERTS) {
-      const toDel = Math.min(count - MAX_ALERTS, PRUNE_BATCH);
-      pruneStmt.run(toDel);
-      console.log(`[DB] Pruned ${toDel} old alerts (cap: ${MAX_ALERTS})`);
-    }
-  } catch(e) { console.error("[DB] prune error:", e.message); }
+  if (pruneRunning) return;
+  pruneRunning = true;
+  let removedOld = 0, removedCap = 0;
+  const step = () => {
+    try {
+      const old = pruneOldStmt.run(`-${ALERT_RETENTION_DAYS} days`).changes;
+      removedOld += old;
+      let capped = 0;
+      if (old < PRUNE_BATCH) {
+        const count = db.prepare("SELECT COUNT(*) as c FROM alerts").get().c;
+        if (count > MAX_ALERTS) capped = pruneStmt.run(Math.min(count - MAX_ALERTS, PRUNE_BATCH)).changes;
+        removedCap += capped;
+      }
+      if (old === PRUNE_BATCH || capped === PRUNE_BATCH) return setImmediate(step);
+    } catch(e) { console.error("[DB] prune error:", e.message); }
+    if (removedOld) console.log(`[DB] Pruned ${removedOld} alerts older than ${ALERT_RETENTION_DAYS} days`);
+    if (removedCap) console.log(`[DB] Pruned ${removedCap} old alerts (cap: ${MAX_ALERTS})`);
+    pruneRunning = false;
+  };
+  step();
 }
 
 // Run prune once on startup + every 60s. Interval-based (not per-insert) so a
