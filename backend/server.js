@@ -1408,7 +1408,11 @@ function startTail(onLine, ctx, logPathOverride) {
   function scheduleReconnect(delayMs, reason) {
     if (reconnectScheduled) return;
     reconnectScheduled = true;
-    if (ctx.ssh === ssh) ctx.ssh = null;
+    // Replaced by a newer tail or stopped on purpose (stopAllTails): don't
+    // reconnect, or the old tail comes back alongside the new one and every
+    // line is stored twice (×4 duplicates were found in the DB).
+    if (ctx.ssh !== ssh) { try { ssh.end(); } catch (_) {} return; }
+    ctx.ssh = null;
     try { ssh.end(); } catch (_) {}
     console.log(`${tag} ${reason} — reconnecting in ${delayMs / 1000}s…`);
     setTimeout(() => startTail(onLine, ctx, logPathOverride), delayMs);
